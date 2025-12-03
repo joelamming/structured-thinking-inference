@@ -1,0 +1,545 @@
+import asyncio
+import base64
+import json
+import logging
+import time
+from contextlib import asynccontextmanager, suppress
+from typing import Any, Dict, Optional, List
+
+import aiofiles
+import httpx
+from cryptography.fernet import Fernet
+from fastapi import (
+    FastAPI,
+    Depends,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.responses import HTMLResponse
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from httpx import Timeout
+from redis.asyncio import from_url as redis_from_url, Redis
+
+from .config import get_settings, Settings
+from .jobs import RedisJobStore
+from .metrics import MetricsSampler
+from .models import EmbeddingRequest, ChatRequest, CompletionWebSocketRequest
+
+
+settings: Settings = get_settings()
+logger = logging.getLogger("custom_vllm.orchestrator")
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+file_log_lock = asyncio.Lock()
+http_client: Optional[httpx.AsyncClient] = None
+redis_client: Optional[Redis] = None
+job_store: Optional[RedisJobStore] = None
+metrics_sampler: Optional[MetricsSampler] = None
+worker_task: Optional[asyncio.Task] = None
+metrics_task: Optional[asyncio.Task] = None
+fernet = Fernet(
+    settings.encryption_key.encode("utf-8")
+    if isinstance(settings.encryption_key, str)
+    else settings.encryption_key
+)
+
+
+async def save_log(record: Dict[str, Any]) -> None:
+    if not settings.enable_request_logs:
+        return
+    async with file_log_lock:
+        async with aiofiles.open(settings.log_file_path, "a") as log_file:
+            await log_file.write(json.dumps(record) + "\n")
+
+
+async def verify_api_key(api_key: str = Depends(api_key_header)) -> str:
+    if not api_key or api_key != settings.api_key:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid API key")
+    return api_key
+
+
+def get_templates_directory() -> str:
+    from pathlib import Path
+
+    static_dir = Path(__file__).resolve().parent.parent / "static"
+    return str(static_dir)
+
+
+templates = Jinja2Templates(directory=get_templates_directory())
+
+
+async def init_redis() -> Redis:
+    return redis_from_url(settings.redis_url, encoding="utf-8", decode_responses=True)
+
+
+async def create_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=Timeout(360.0),
+        limits=httpx.Limits(max_connections=256, max_keepalive_connections=64),
+    )
+
+
+async def worker_loop():
+    assert redis_client and job_store and http_client
+    completions_url = settings.llm_server_url
+    while True:
+        active_incremented = False
+        try:
+            blpop_result = await redis_client.blpop(settings.job_queue_key, timeout=1)
+            if not blpop_result:
+                continue
+            _, job_id = blpop_result
+            job_key = job_store.job_key(job_id)
+            job_payload = await redis_client.hgetall(job_key)
+            if not job_payload:
+                continue
+            await job_store.increment_active()
+            active_incremented = True
+            await job_store.update_status(job_id, "running", started_ts=time.time())
+            request_json = job_payload.get("request")
+            client_request_id = job_payload.get("client_request_id") or None
+            if not request_json:
+                raise ValueError("Missing request payload")
+            request_dict = json.loads(request_json)
+            chat_request = ChatRequest.model_validate(request_dict)
+            result_payload = await process_chat_request(
+                chat_request,
+                job_id=job_id,
+                client_request_id=client_request_id,
+                completions_url=completions_url,
+            )
+            await job_store.update_status(job_id, "completed", finished_ts=time.time())
+            await job_store.publish_result(
+                job_id,
+                {"status": "completed", "request_id": job_id, "result": result_payload},
+            )
+            await save_log({
+                "request_id": job_id,
+                "client_request_id": client_request_id,
+                "status": "completed",
+                "response_metadata": result_payload.get("usage"),
+                "timestamp": time.time(),
+            })
+        except Exception as exc:
+            logger.exception("Worker error")
+            if 'job_id' in locals():
+                await job_store.update_status(job_id, "error", error=str(exc))
+                await job_store.publish_result(
+                    job_id,
+                    {"status": "error", "request_id": job_id, "error": str(exc)},
+                )
+                await save_log({
+                    "request_id": job_id,
+                    "status": "error",
+                    "error": str(exc),
+                    "timestamp": time.time(),
+                })
+        finally:
+            if active_incremented:
+                await job_store.decrement_active()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global redis_client, http_client, job_store, metrics_sampler, worker_task, metrics_task
+    http_client = await create_http_client()
+    redis_client = await init_redis()
+    job_store = RedisJobStore(redis_client, settings)
+    metrics_sampler = MetricsSampler(redis_client, settings, job_store, http_client)
+    worker_task = asyncio.create_task(worker_loop())
+    metrics_task = asyncio.create_task(metrics_sampler.run())
+    try:
+        yield
+    finally:
+        for task in (worker_task, metrics_task):
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        if http_client:
+            await http_client.aclose()
+        if redis_client:
+            await redis_client.close()
+
+
+app = FastAPI(
+    title="Custom vLLM Orchestrator",
+    version="0.1.0",
+    lifespan=lifespan,
+    openapi_version=settings.openapi_version,
+)
+
+app.mount("/static", StaticFiles(directory=get_templates_directory()), name="static")
+
+
+def format_prompt_for_llm(messages: List[Dict[str, str]], model_name: str) -> str:
+    model_short_name = model_name.lower()
+    full_prompt: List[str] = []
+    if "qwen3" in model_short_name and "deepseek" not in model_short_name:
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            full_prompt.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+        full_prompt.append("<|im_start|>assistant\n<think>\n")
+        return "\n".join(full_prompt)
+    if "deepseek" in model_short_name:
+        user_prompt = ""
+        if messages and messages[-1].get("role") == "user":
+            user_prompt = messages[-1]["content"]
+        return "<|begin of sentence|> " + user_prompt + " <|Assistant|><think>\n"
+    raise ValueError(f"Unknown model type '{model_name}' for custom prompt formatting.")
+
+
+async def process_chat_request(
+    request: ChatRequest,
+    job_id: str,
+    client_request_id: Optional[str],
+    completions_url: str,
+) -> Dict[str, Any]:
+    assert http_client is not None
+    request_fernet = fernet
+    logger_prefix = f"[Job {job_id}"
+    if client_request_id:
+        logger_prefix += f", Client {client_request_id[:8]}"
+    logger_prefix += "] "
+
+    decrypted_messages: List[Dict[str, str]] = []
+    for message in request.messages:
+        encrypted_content_b64 = message.get("content", "")
+        if isinstance(encrypted_content_b64, str):
+            encrypted_content_bytes = base64.b64decode(encrypted_content_b64)
+            decrypted_content = request_fernet.decrypt(encrypted_content_bytes).decode("utf-8")
+            decrypted_messages.append({"role": message.get("role", "user"), "content": decrypted_content})
+
+    formatted_prompt_for_tokenisation = format_prompt_for_llm(decrypted_messages, request.model)
+    needs_two_step = False
+    json_schema = None
+    guided_regex = None
+    guided_choice = None
+    guided_grammar = None
+    guided_decoding_backend = None
+    structural_tag = None
+
+    if request.extra_body:
+        extra = request.extra_body
+        if "guided_json" in extra:
+            json_schema = extra["guided_json"]
+            needs_two_step = True
+        if "guided_regex" in extra:
+            guided_regex = extra["guided_regex"]
+            needs_two_step = True
+        if "guided_choice" in extra:
+            guided_choice = extra["guided_choice"]
+            needs_two_step = True
+        if "guided_grammar" in extra:
+            guided_grammar = extra["guided_grammar"]
+            needs_two_step = True
+        if "guided_decoding_backend" in extra:
+            guided_decoding_backend = extra["guided_decoding_backend"]
+        if "structural_tag" in extra:
+            structural_tag = extra["structural_tag"]
+            needs_two_step = True
+
+    if not json_schema and request.response_format:
+        rf = request.response_format
+        if isinstance(rf, dict):
+            if rf.get("type") == "json_object":
+                json_schema = {"type": "object"}
+                needs_two_step = True
+            elif rf.get("type") == "json_schema":
+                json_schema_obj = (
+                    rf.get("json_schema", {}).get("schema")
+                    or rf.get("schema")
+                )
+                if json_schema_obj:
+                    json_schema = json_schema_obj
+                    needs_two_step = True
+
+    if not needs_two_step:
+        raise ValueError("No guided decoding requested")
+
+    formatted_prompt = formatted_prompt_for_tokenisation
+    base_prompt_for_later_steps = formatted_prompt.rsplit("<think>", 1)[0]
+
+    thinking_request = {
+        "model": request.model,
+        "prompt": formatted_prompt,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "max_tokens": request.max_tokens,
+        "stream": False,
+        "stop": ["</think>"],
+        "repetition_penalty": request.repetition_penalty,
+    }
+    completions_single_url = completions_url
+    thinking_response_1 = await http_client.post(
+        completions_single_url,
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-ID": f"{job_id}-thinking-1",
+            "X-Client-Request-ID": client_request_id or "none",
+        },
+        json=thinking_request,
+        timeout=None,
+    )
+    thinking_response_1.raise_for_status()
+    thinking_data_1 = thinking_response_1.json()
+    thinking_content_1 = ""
+    if "choices" in thinking_data_1 and thinking_data_1["choices"]:
+        thinking_content_1 = thinking_data_1["choices"][0].get("text", "")
+
+    prompt_step_2 = formatted_prompt + thinking_content_1 + "</think>\n"
+    guided_request_1 = {
+        "model": request.model,
+        "prompt": prompt_step_2,
+        "temperature": 0.0,
+        "top_p": request.top_p,
+        "max_tokens": request.max_tokens,
+        "stream": False,
+        "repetition_penalty": request.repetition_penalty,
+    }
+    if request.stop:
+        guided_request_1["stop"] = request.stop
+    if json_schema:
+        guided_request_1["guided_json"] = json_schema
+    if guided_regex:
+        guided_request_1["guided_regex"] = guided_regex
+    if guided_choice:
+        guided_request_1["guided_choice"] = guided_choice
+    if guided_grammar:
+        guided_request_1["guided_grammar"] = guided_grammar
+    if structural_tag:
+        guided_request_1["structural_tag"] = structural_tag
+    if guided_decoding_backend:
+        guided_request_1["guided_decoding_backend"] = guided_decoding_backend
+
+    response_1 = await http_client.post(
+        completions_single_url,
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-ID": f"{job_id}-guided-1",
+            "X-Client-Request-ID": client_request_id or "none",
+        },
+        json=guided_request_1,
+        timeout=None,
+    )
+    response_1.raise_for_status()
+    resp1_json = response_1.json()
+    structured_content_1 = ""
+    if isinstance(resp1_json, dict) and resp1_json.get("choices"):
+        first_choice = resp1_json["choices"][0]
+        structured_content_1 = first_choice.get("text") or first_choice.get("message", {}).get("content", "")
+    if not structured_content_1:
+        raise ValueError("Guided decoding (step 2) returned no content")
+
+    correction_thinking_body = (
+        f"{thinking_content_1.strip()}\n\nMy final output will therefore be:\n\n{structured_content_1.strip()}"
+        f"\n\nWait, have I made a mistake here?\n"
+    )
+    prompt_step_3 = base_prompt_for_later_steps + f"<think>\n{correction_thinking_body}\n"
+
+    thinking_request_2 = {
+        "model": request.model,
+        "prompt": prompt_step_3,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "max_tokens": request.max_tokens,
+        "stream": False,
+        "stop": ["</think>"],
+        "repetition_penalty": request.repetition_penalty,
+    }
+    thinking_response_2 = await http_client.post(
+        completions_single_url,
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-ID": f"{job_id}-thinking-2",
+            "X-Client-Request-ID": client_request_id or "none",
+        },
+        json=thinking_request_2,
+        timeout=None,
+    )
+    thinking_response_2.raise_for_status()
+    thinking_data_2 = thinking_response_2.json()
+    thinking_correction = ""
+    if "choices" in thinking_data_2 and thinking_data_2["choices"]:
+        thinking_correction = thinking_data_2["choices"][0].get("text", "")
+
+    thinking_content = f"{correction_thinking_body}\n{thinking_correction}"
+    final_prompt = base_prompt_for_later_steps + f"<think>\n{thinking_content}</think>\n"
+
+    guided_request = {
+        "model": request.model,
+        "prompt": final_prompt,
+        "temperature": 0.0,
+        "top_p": request.top_p,
+        "max_tokens": request.max_tokens,
+        "stream": False,
+        "repetition_penalty": request.repetition_penalty,
+    }
+    if request.stop:
+        guided_request["stop"] = request.stop
+    if json_schema:
+        guided_request["guided_json"] = json_schema
+    if guided_regex:
+        guided_request["guided_regex"] = guided_regex
+        if "stop" not in guided_request or not guided_request["stop"]:
+            guided_request["stop"] = ["</s>"]
+        elif "</s>" not in guided_request["stop"]:
+            guided_request["stop"].append("</s>")
+    if guided_choice:
+        guided_request["guided_choice"] = guided_choice
+    if guided_grammar:
+        guided_request["guided_grammar"] = guided_grammar
+    if structural_tag:
+        guided_request["structural_tag"] = structural_tag
+    if guided_decoding_backend:
+        guided_request["guided_decoding_backend"] = guided_decoding_backend
+
+    response = await http_client.post(
+        completions_single_url,
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-ID": job_id,
+            "X-Client-Request-ID": client_request_id or "none",
+        },
+        json=guided_request,
+        timeout=None,
+    )
+    response.raise_for_status()
+    response_data = response.json()
+    isolated_response_data = json.loads(json.dumps(response_data))
+    this_request_content = None
+    if isolated_response_data.get("choices"):
+        choice = isolated_response_data["choices"][0]
+        text_content = choice.get("text")
+        if text_content is None and choice.get("message"):
+            text_content = choice["message"].get("content")
+        this_request_content = text_content
+        choice["message"] = {
+            "role": "assistant",
+            "content": this_request_content,
+            "thinking": thinking_content,
+        }
+        choice["finish_reason"] = choice.get("finish_reason", "stop")
+        choice.pop("text", None)
+
+    if isolated_response_data.get("choices"):
+        message = isolated_response_data["choices"][0]["message"]
+        content_bytes = message["content"].encode("utf-8")
+        encrypted_content = request_fernet.encrypt(content_bytes)
+        message["content"] = base64.b64encode(encrypted_content).decode("ascii")
+        if "thinking" in message and message["thinking"]:
+            thinking_bytes = message["thinking"].encode("utf-8")
+            encrypted_thinking = request_fernet.encrypt(thinking_bytes)
+            message["thinking"] = base64.b64encode(encrypted_thinking).decode("ascii")
+
+    return isolated_response_data
+
+
+@app.websocket("/ws/completions")
+async def websocket_completions(websocket: WebSocket):
+    api_key = websocket.headers.get("X-API-Key")
+    if api_key != settings.api_key:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    await websocket.accept()
+    active_connections_key = "llm:ws:connections"
+    assert redis_client is not None and job_store is not None
+    await redis_client.incr(active_connections_key)
+
+    try:
+        while True:
+            message = await websocket.receive_text()
+            try:
+                payload = json.loads(message)
+                ws_request = CompletionWebSocketRequest.model_validate(payload)
+            except Exception as exc:
+                await websocket.send_json(
+                    {"type": "error", "error": f"Invalid payload: {str(exc)}"}
+                )
+                continue
+
+            job_id = await job_store.enqueue_job(
+                ws_request.request.model_dump(),
+                ws_request.client_request_id,
+            )
+            timeout_seconds = int(ws_request.timeout_seconds or settings.job_timeout_seconds)
+            try:
+                result = await job_store.wait_for_result(job_id, timeout_seconds)
+                await websocket.send_json(result)
+            except asyncio.TimeoutError:
+                await websocket.send_json(
+                    {"type": "timeout", "request_id": job_id, "error": "Request timed out"}
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        new_value = await redis_client.decr(active_connections_key)
+        if new_value < 0:
+            await redis_client.set(active_connections_key, 0)
+
+
+@app.post("/embeddings")
+async def embeddings_endpoint(
+    request: EmbeddingRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    assert http_client is not None
+    decrypted_texts: List[str] = []
+    for text in request.input_texts:
+        encrypted_bytes = base64.b64decode(text)
+        decrypted_bytes = fernet.decrypt(encrypted_bytes)
+        decrypted_texts.append(decrypted_bytes.decode("utf-8"))
+    payload = {
+        "model": request.model,
+        "input": decrypted_texts,
+        "encoding_format": request.encoding_format,
+    }
+    response = await http_client.post(
+        settings.embedding_server_url,
+        headers={"Content-Type": "application/json"},
+        json=payload,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page(request: Request):
+    return templates.TemplateResponse("dashboard.html", {"request": request})
+
+
+@app.get("/dashboard/metrics", response_class=HTMLResponse)
+async def dashboard_metrics(request: Request):
+    assert redis_client is not None
+    metrics_raw = await redis_client.get("llm:metrics:current")
+    chart_raw = await redis_client.get("llm:metrics:chart")
+    metrics_data = json.loads(metrics_raw) if metrics_raw else {"timestamp": "n/a"}
+    chart_data = json.loads(chart_raw) if chart_raw else {
+        "labels": [],
+        "avg_gen_throughput": [],
+        "gpu_cache_usage": [],
+        "memory_usage_percent": [],
+        "gpu_utilisation": [],
+    }
+    context = {
+        "request": request,
+        "metrics": metrics_data,
+        "chart_data": chart_data,
+    }
+    return templates.TemplateResponse("metrics_partial.html", context)
+
+
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok"}
+

@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Server Dashboard</title>
+    <script src="/static/htmx.min.js"></script> <!-- Assuming htmx.js is in /static -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f9; color: #333; }
+        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #5a5a5a; text-align: center; }
+        h2 { color: #333; margin-top: 30px; border-bottom: 1px solid #eee; padding-bottom: 5px;}
+        .metrics-container { margin-bottom: 30px; }
+        .charts-container { display: grid; grid-template-columns: 1fr; gap: 30px; } /* Single column for now, can be 1fr 1fr for side-by-side */
+        .chart-card { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.05); }
+        /* Styles for metric cards from previous version - will be in metrics_partial.html */
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
+        .metric-card { background-color: #e9ecef; padding: 15px; border-radius: 5px; }
+        .metric-card h3 { margin-top: 0; color: #007bff; }
+        .metric-card p { margin-bottom: 0; font-size: 1.2em; font-weight: bold; }
+        .timestamp { margin-bottom: 15px; font-size: 0.9em; color: #6c757d; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>LLM Server Metrics Dashboard</h1>
+
+        <h2>Live Metrics</h2>
+        <div id="metrics-data-current" class="metrics-container" hx-get="/dashboard/metrics" hx-trigger="load, every 5s" hx-swap="innerHTML">
+            <p>Loading metrics...</p>
+        </div>
+
+        <h2>Performance Trends</h2>
+        <div class="charts-container">
+            <div class="chart-card">
+                <h3>Throughput & GPU Cache</h3>
+                <canvas id="throughputChart"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>GPU Resource Usage</h3>
+                <canvas id="gpuResourceChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let throughputChartInstance, gpuResourceChartInstance;
+
+        function initializeCharts() {
+            const throughputCtx = document.getElementById('throughputChart').getContext('2d');
+            throughputChartInstance = new Chart(throughputCtx, {
+                type: 'line',
+                data: { labels: [], datasets: [
+                    { label: 'Avg Gen Throughput (toks/s)', borderColor: 'rgb(75, 192, 192)', tension: 0.1, fill: false, yAxisID: 'yThroughput', pointRadius: 0 },
+                    { label: 'MA 1m', borderColor: 'rgb(0, 128, 255)', tension: 0.1, fill: false, yAxisID: 'yThroughput', borderDash: [5, 4], pointRadius: 0, borderWidth: 1 },
+                    { label: 'MA 5m', borderColor: 'rgb(0, 200, 100)', tension: 0.1, fill: false, yAxisID: 'yThroughput', borderDash: [6, 4], pointRadius: 0, borderWidth: 1 },
+                    { label: 'MA 10m', borderColor: 'rgb(150, 100, 200)', tension: 0.1, fill: false, yAxisID: 'yThroughput', borderDash: [7, 4], pointRadius: 0, borderWidth: 1 },
+                    { label: 'GPU Cache Usage (%)', borderColor: 'rgb(255, 159, 64)', tension: 0.1, fill: false, yAxisID: 'yPercentage', pointRadius: 0 }
+                ]},
+                options: { scales: { 
+                    yThroughput: { type: 'linear', display: true, position: 'left', title: {display: true, text: 'Tok/s'} },
+                    yPercentage: { type: 'linear', display: true, position: 'right', min:0, max:100, title: {display: true, text: '% Usage'}, grid: { drawOnChartArea: false } } 
+                }, responsive: true, maintainAspectRatio: true }
+            });
+
+            const gpuResourceCtx = document.getElementById('gpuResourceChart').getContext('2d');
+            gpuResourceChartInstance = new Chart(gpuResourceCtx, {
+                type: 'line',
+                data: { labels: [], datasets: [
+                    { label: 'GPU Memory Usage (%)', borderColor: 'rgb(255, 99, 132)', tension: 0.1, fill: false, yAxisID: 'yPercentage' },
+                    { label: 'GPU Utilisation (%)', borderColor: 'rgb(54, 162, 235)', tension: 0.1, fill: false, yAxisID: 'yPercentage2' }
+                ]},
+                options: { scales: { 
+                    yPercentage: { type: 'linear', display: true, position: 'left', min:0, max:100, title: {display: true, text: 'Memory %'} },
+                    yPercentage2: { type: 'linear', display: true, position: 'right', min:0, max:100, title: {display: true, text: 'Util %'}, grid: { drawOnChartArea: false } }
+                 }, responsive: true, maintainAspectRatio: true }
+            });
+        }
+
+        function movingAverage(values, windowSize) {
+            const result = [];
+            let sum = 0;
+            const buffer = [];
+            for (let i = 0; i < values.length; i++) {
+                const v = Number(values[i]) || 0;
+                buffer.push(v);
+                sum += v;
+                if (buffer.length > windowSize) {
+                    sum -= buffer.shift();
+                }
+                if (buffer.length < windowSize) {
+                    result.push(null);
+                } else {
+                    result.push(sum / windowSize);
+                }
+            }
+            return result;
+        }
+
+        function updateChartData() {
+            const chartDataElement = document.getElementById('chart-data-json');
+            if (chartDataElement && chartDataElement.textContent) {
+                try {
+                    const data = JSON.parse(chartDataElement.textContent);
+                    if (data && data.labels) {
+                        // Update Throughput Chart
+                        throughputChartInstance.data.labels = data.labels;
+                        throughputChartInstance.data.datasets[0].data = data.avg_gen_throughput;
+
+                        // Compute moving averages based on 5s sampling cadence
+                        const window1m = 12;   // 60s / 5s
+                        const window5m = 60;   // 300s / 5s
+                        const window10m = 120; // 600s / 5s
+                        const ma1 = movingAverage(data.avg_gen_throughput, window1m);
+                        const ma5 = movingAverage(data.avg_gen_throughput, window5m);
+                        const ma10 = movingAverage(data.avg_gen_throughput, window10m);
+                        throughputChartInstance.data.datasets[1].data = ma1;
+                        throughputChartInstance.data.datasets[2].data = ma5;
+                        throughputChartInstance.data.datasets[3].data = ma10;
+
+                        // GPU cache usage (right axis)
+                        throughputChartInstance.data.datasets[4].data = data.gpu_cache_usage;
+                        throughputChartInstance.update('none'); // 'none' for no animation
+
+                        // Update GPU Resource Chart
+                        gpuResourceChartInstance.data.labels = data.labels;
+                        gpuResourceChartInstance.data.datasets[0].data = data.memory_usage_percent;
+                        gpuResourceChartInstance.data.datasets[1].data = data.gpu_utilisation;
+                        gpuResourceChartInstance.update('none'); // 'none' for no animation
+                    }
+                } catch (e) {
+                    console.error("Failed to parse chart data:", e);
+                }
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeCharts();
+        });
+
+        // Listen for HTMX event to update charts
+        // htmx:afterSettle ensures the new content (with chart data) is in the DOM
+        document.getElementById('metrics-data-current').addEventListener('htmx:afterSettle', function(event) {
+            updateChartData();
+        });
+    </script>
+</body>
+</html> 

@@ -1,0 +1,48 @@
+<div class="timestamp">Last updated: {{ metrics.timestamp }}</div>
+<div class="metrics-grid">
+    <div class="metric-card">
+        <h3>Avg. Gen Throughput</h3>
+        <p>{{ "%.2f"|format(metrics.get('vllm:avg_generation_throughput_toks_per_s', 0)) }} toks/s</p>
+    </div>
+    <div class="metric-card">
+        <h3>Avg. Prompt Throughput</h3>
+        <p>{{ "%.2f"|format(metrics.get('vllm:avg_prompt_throughput_toks_per_s', 0)) }} toks/s</p>
+    </div>
+    <div class="metric-card">
+        <h3>GPU Cache Usage</h3>
+        <p>{{ "%.2f"|format(metrics.get('vllm:gpu_cache_usage_perc', 0)) }}%</p>
+    </div>
+    <div class="metric-card">
+        <h3>CPU Cache Usage</h3>
+        <p>{{ "%.2f"|format(metrics.get('vllm:cpu_cache_usage_perc', 0)) }}%</p>
+    </div>
+    <div class="metric-card">
+        <h3>Requests Running</h3>
+        <p>{{ metrics.get('vllm:num_requests_running', 0) }}</p>
+    </div>
+    <div class="metric-card">
+        <h3>Requests Waiting</h3>
+        <p>{{ metrics.get('vllm:num_requests_waiting', 0) }}</p>
+    </div>
+    <div class="metric-card">
+        <h3>Requests Swapped</h3>
+        <p>{{ metrics.get('vllm:num_requests_swapped', 0) }}</p>
+    </div>
+    <div class="metric-card">
+        <h3>GPU Utilisation</h3>
+        <p>{{ "%.0f"|format(metrics.get('gpu_utilisation_percent', 0)) }}%</p>
+    </div>
+    <div class="metric-card">
+        <h3>GPU Memory Usage</h3>
+        <p>{{ "%.2f"|format(metrics.get('memory_usage_percent', 0)) }}% ({{ metrics.get('memory_usage_mb', 0) }} / {{ metrics.get('memory_total_mb', 0) }} MB)</p>
+    </div>
+    <div class="metric-card">
+        <h3>GPU Power Draw</h3>
+        <p>{{ "%.1f"|format(metrics.get('power_draw_w', 0)) }}W / {{ "%.1f"|format(metrics.get('power_limit_w', 0)) }}W</p>
+    </div>
+</div>
+
+<!-- Embed chart data as JSON -->
+<script type="application/json" id="chart-data-json">
+    {{ chart_data | tojson | safe }}
+</script> 
