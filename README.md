@@ -1,4 +1,4 @@
-# Docker Compose stack for a CoT-focused guided decoding inference engine
+# Webserver with configurable CoT with guided decoding final output, inference engine based on vLLM
 
 ## Services
 
