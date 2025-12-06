@@ -1,5 +1,7 @@
 # Webserver with configurable CoT with guided decoding final output, inference engine based on vLLM
 
+Public-facing implementation
+
 ## Services
 
 - `redis`: Ephemeral queue/cache/metrics store (no persistence).
