@@ -3,7 +3,6 @@ from typing import Optional
 
 from pydantic_settings import BaseSettings
 
-
 class Settings(BaseSettings):
     api_key: str
     encryption_key: str

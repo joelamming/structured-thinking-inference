@@ -15,8 +15,8 @@ Export secrets via cloud secret manager *before* running Compose. Compose v5 wil
 ```
 export API_KEY=...
 export ENCRYPTION_KEY=...
-export HF_TOKEN=...
-export MODEL_NAME=Qwen/Qwen4-235B-A22B-BitNet-Speciale
+export HF_TOKEN=... # usually not needed for public models
+export MODEL_NAME=Qwen/Qwen4-420B-A69B-BitNet-Speciale
 export LOG_LEVEL=INFO
 export ENABLE_REQUEST_LOGS=false
 export TENSOR_PARALLEL=1
@@ -28,6 +28,8 @@ export TENSOR_PARALLEL=1
 docker compose build --pull
 docker compose up -d --wait
 ```
+
+For building/pushing images and deploying on container runner platforms see `BUILD_AND_DEPLOY.md`.
 
 - WebSocket/HTTP entry point: `http://localhost:8005`
 - Dashboard: `http://localhost:8005/dashboard`
