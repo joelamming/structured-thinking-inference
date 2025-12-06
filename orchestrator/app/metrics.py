@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import re
 import subprocess
@@ -8,27 +7,23 @@ from collections import deque
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from redis.asyncio import Redis
-
 from .config import Settings
-from .jobs import RedisJobStore
+from .jobs import InMemoryJobStore
 
 
 METRIC_LINE_RE = re.compile(
-    r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)$'
+    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)$"
 )
 
 
 class MetricsSampler:
     def __init__(
         self,
-        redis: Redis,
         settings: Settings,
-        job_store: RedisJobStore,
+        job_store: InMemoryJobStore,
         http_client,
         max_points: int = 120,
     ):
-        self.redis = redis
         self.settings = settings
         self.job_store = job_store
         self.http_client = http_client
@@ -40,10 +35,13 @@ class MetricsSampler:
         self.chart_gpu_cache_usage: deque[float] = deque(maxlen=max_points)
         self.chart_memory_usage_percent: deque[float] = deque(maxlen=max_points)
         self.chart_gpu_utilisation: deque[float] = deque(maxlen=max_points)
+        self.latest_metrics: Dict[str, Any] = {}
 
     async def fetch_server_metrics(self) -> Optional[str]:
         try:
-            response = await self.http_client.get(self.settings.llm_metrics_url, timeout=5)
+            response = await self.http_client.get(
+                self.settings.llm_metrics_url, timeout=5
+            )
             response.raise_for_status()
             return response.text
         except Exception:
@@ -68,7 +66,9 @@ class MetricsSampler:
 
     def compute_throughput(self, parsed: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
         prompt_total = parsed.get("vllm:prompt_tokens_total", {}).get("value", 0.0)
-        generation_total = parsed.get("vllm:generation_tokens_total", {}).get("value", 0.0)
+        generation_total = parsed.get("vllm:generation_tokens_total", {}).get(
+            "value", 0.0
+        )
         now = time.time()
         delta_t = now - self.last_collection_ts if self.last_collection_ts else 0.0
 
@@ -125,7 +125,9 @@ class MetricsSampler:
             power_draw = float(values[2])
             power_limit = float(values[3])
             gpu_utilisation = float(values[4])
-            memory_usage_percent = (memory_used / memory_total * 100) if memory_total else 0.0
+            memory_usage_percent = (
+                (memory_used / memory_total * 100) if memory_total else 0.0
+            )
             return {
                 "memory_usage_mb": memory_used,
                 "memory_total_mb": memory_total,
@@ -142,16 +144,19 @@ class MetricsSampler:
         parsed: Dict[str, Dict[str, Any]] = {}
         if metrics_text:
             parsed = self.parse_metrics(metrics_text)
-        throughput = self.compute_throughput(parsed) if parsed else {
-            "vllm:avg_prompt_throughput_toks_per_s": 0.0,
-            "vllm:avg_generation_throughput_toks_per_s": 0.0,
-        }
+        throughput = (
+            self.compute_throughput(parsed)
+            if parsed
+            else {
+                "vllm:avg_prompt_throughput_toks_per_s": 0.0,
+                "vllm:avg_generation_throughput_toks_per_s": 0.0,
+            }
+        )
         gpu_metrics = await self.get_gpu_metrics()
-        queue_depth = await self.redis.llen(self.settings.job_queue_key)
-        active_jobs_raw = await self.redis.get(self.job_store.active_counter_key)
-        active_jobs = int(active_jobs_raw or 0)
-        ws_connections_raw = await self.redis.get("llm:ws:connections")
-        ws_connections = int(ws_connections_raw or 0)
+        counters = await self.job_store.get_counters()
+        queue_depth = counters["queue_depth"]
+        active_jobs = counters["active_jobs"]
+        ws_connections = counters["websocket_connections"]
 
         current_timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         current_metrics = {
@@ -178,10 +183,18 @@ class MetricsSampler:
 
         # Update chart series
         self.chart_labels.append(datetime.utcnow().strftime("%H:%M:%S"))
-        self.chart_avg_gen_throughput.append(current_metrics.get("vllm:avg_generation_throughput_toks_per_s", 0.0))
-        self.chart_gpu_cache_usage.append(current_metrics.get("vllm:gpu_cache_usage_perc", 0.0))
-        self.chart_memory_usage_percent.append(current_metrics.get("memory_usage_percent", 0.0))
-        self.chart_gpu_utilisation.append(current_metrics.get("gpu_utilisation_percent", 0.0))
+        self.chart_avg_gen_throughput.append(
+            current_metrics.get("vllm:avg_generation_throughput_toks_per_s", 0.0)
+        )
+        self.chart_gpu_cache_usage.append(
+            current_metrics.get("vllm:gpu_cache_usage_perc", 0.0)
+        )
+        self.chart_memory_usage_percent.append(
+            current_metrics.get("memory_usage_percent", 0.0)
+        )
+        self.chart_gpu_utilisation.append(
+            current_metrics.get("gpu_utilisation_percent", 0.0)
+        )
 
         chart_data = {
             "labels": list(self.chart_labels),
@@ -191,10 +204,10 @@ class MetricsSampler:
             "gpu_utilisation": list(self.chart_gpu_utilisation),
         }
 
-        pipe = self.redis.pipeline()
-        pipe.set("llm:metrics:current", json.dumps(current_metrics))
-        pipe.set("llm:metrics:chart", json.dumps(chart_data))
-        await pipe.execute()
+        self.latest_metrics = {
+            "current": current_metrics,
+            "chart": chart_data,
+        }
 
     async def run(self) -> None:
         interval = max(1, self.settings.metrics_interval_seconds)
@@ -205,4 +218,3 @@ class MetricsSampler:
             except Exception as exc:
                 logger.warning("Metrics sampler error: %s", exc)
             await asyncio.sleep(interval)
-

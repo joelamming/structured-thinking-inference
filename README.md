@@ -2,36 +2,31 @@
 
 Public-facing implementation
 
-## Services
+## Services (single container)
 
-- `redis`: Ephemeral queue/cache/metrics store (no persistence).
-- `orchestrator`: FastAPI app handling encryption, Redis queueing, WebSocket completions, embeddings and the HTMX metrics dashboard.
-- `vllm`: Official `ghcr.io/vllm-project/vllm-openai` server exposing the OpenAI-compatible API surface on port `8000`.
+- `vllm` server running inside the same container (port `8000`).
+- `orchestrator` FastAPI app (port `8005`) with an in-memory queue/cache (lost on restart).
 
 ## Required envs
 
-Export secrets via cloud secret manager *before* running Compose. Compose v5 will read host env vars such as:
+Export secrets via your runner (e.g. RunPod env vars) before starting the container:
 
 ```
-export API_KEY=...
-export ENCRYPTION_KEY=...
+export ORCH_API_KEY=...
+export ORCH_ENCRYPTION_KEY=...
 export HF_TOKEN=... # usually not needed for public models
 export MODEL_NAME=Qwen/Qwen4-420B-A69B-BitNet-Speciale
-export LOG_LEVEL=INFO
-export ENABLE_REQUEST_LOGS=false
+export ORCH_LOG_LEVEL=INFO
+export ORCH_ENABLE_REQUEST_LOGS=false
 export TENSOR_PARALLEL=1
 ```
 
 ## Usage
 
-```
-docker compose build --pull
-docker compose up -d --wait
-```
+Build/push the single image (see `BUILD_AND_DEPLOY.md` for GHCR instructions), then run it with GPU support. Two processes run under `supervisord` inside the container: `vllm serve` on `8000` and `uvicorn app.main:app` on `8005`.
 
-For building/pushing images and deploying on container runner platforms see `BUILD_AND_DEPLOY.md`.
-
-- WebSocket/HTTP entry point: `http://localhost:8005`
+- WebSocket completions (final response over WS): `ws://localhost:8005/ws/completions`
+- Embeddings: `http://localhost:8005/embeddings`
 - Dashboard: `http://localhost:8005/dashboard`
 - OpenAPI docs: `http://localhost:8005/docs`
 

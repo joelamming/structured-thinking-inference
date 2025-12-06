@@ -1,27 +1,27 @@
-FROM python:3.13-slim AS base
+FROM ghcr.io/vllm-project/vllm-openai:latest
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    UV_LINK_MODE=copy \
-    UV_HTTP_TIMEOUT=600
+    TENSOR_PARALLEL=1 \
+    ORCH_LOG_LEVEL=INFO \
+    ORCH_ENABLE_REQUEST_LOGS=false
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
-        build-essential \
+        supervisor \
     && rm -rf /var/lib/apt/lists/*
 
 COPY orchestrator/requirements.txt /tmp/requirements.txt
-RUN pip install --upgrade pip uv && \
-    uv pip install --system --no-cache -r /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY orchestrator/app /app/app
 COPY orchestrator/static /app/static
+COPY orchestrator/supervisord.conf /etc/supervisor/conf.d/orchestrator.conf
 RUN mkdir -p /app/logs
 
-EXPOSE 8005
+EXPOSE 8000 8005
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8005"]
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/orchestrator.conf"]
 

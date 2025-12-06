@@ -23,10 +23,9 @@ from fastapi.security.api_key import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from httpx import Timeout
-from redis.asyncio import from_url as redis_from_url, Redis
 
 from .config import get_settings, Settings
-from .jobs import RedisJobStore
+from .jobs import InMemoryJobStore
 from .metrics import MetricsSampler
 from .models import EmbeddingRequest, ChatRequest, CompletionWebSocketRequest
 
@@ -41,11 +40,11 @@ logging.basicConfig(
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 file_log_lock = asyncio.Lock()
 http_client: Optional[httpx.AsyncClient] = None
-redis_client: Optional[Redis] = None
-job_store: Optional[RedisJobStore] = None
+job_store: Optional[InMemoryJobStore] = None
 metrics_sampler: Optional[MetricsSampler] = None
 worker_task: Optional[asyncio.Task] = None
 metrics_task: Optional[asyncio.Task] = None
+cleanup_task: Optional[asyncio.Task] = None
 fernet = Fernet(
     settings.encryption_key.encode("utf-8")
     if isinstance(settings.encryption_key, str)
@@ -63,7 +62,9 @@ async def save_log(record: Dict[str, Any]) -> None:
 
 async def verify_api_key(api_key: str = Depends(api_key_header)) -> str:
     if not api_key or api_key != settings.api_key:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid API key")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Invalid API key"
+        )
     return api_key
 
 
@@ -77,10 +78,6 @@ def get_templates_directory() -> str:
 templates = Jinja2Templates(directory=get_templates_directory())
 
 
-async def init_redis() -> Redis:
-    return redis_from_url(settings.redis_url, encoding="utf-8", decode_responses=True)
-
-
 async def create_http_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         timeout=Timeout(360.0),
@@ -89,28 +86,23 @@ async def create_http_client() -> httpx.AsyncClient:
 
 
 async def worker_loop():
-    assert redis_client and job_store and http_client
+    assert job_store and http_client
     completions_url = settings.llm_server_url
     while True:
         active_incremented = False
         try:
-            blpop_result = await redis_client.blpop(settings.job_queue_key, timeout=1)
-            if not blpop_result:
+            job_tuple = await job_store.get_next_job(timeout_seconds=1)
+            if not job_tuple:
                 continue
-            _, job_id = blpop_result
-            job_key = job_store.job_key(job_id)
-            job_payload = await redis_client.hgetall(job_key)
-            if not job_payload:
+            job_id, request_payload, client_request_id = job_tuple
+            # Skip if canceled before processing
+            status_record = await job_store.get_status(job_id)
+            if status_record and status_record.get("status") == "cancelled":
                 continue
             await job_store.increment_active()
             active_incremented = True
             await job_store.update_status(job_id, "running", started_ts=time.time())
-            request_json = job_payload.get("request")
-            client_request_id = job_payload.get("client_request_id") or None
-            if not request_json:
-                raise ValueError("Missing request payload")
-            request_dict = json.loads(request_json)
-            chat_request = ChatRequest.model_validate(request_dict)
+            chat_request = ChatRequest.model_validate(request_payload)
             result_payload = await process_chat_request(
                 chat_request,
                 job_id=job_id,
@@ -122,27 +114,31 @@ async def worker_loop():
                 job_id,
                 {"status": "completed", "request_id": job_id, "result": result_payload},
             )
-            await save_log({
-                "request_id": job_id,
-                "client_request_id": client_request_id,
-                "status": "completed",
-                "response_metadata": result_payload.get("usage"),
-                "timestamp": time.time(),
-            })
+            await save_log(
+                {
+                    "request_id": job_id,
+                    "client_request_id": client_request_id,
+                    "status": "completed",
+                    "response_metadata": result_payload.get("usage"),
+                    "timestamp": time.time(),
+                }
+            )
         except Exception as exc:
             logger.exception("Worker error")
-            if 'job_id' in locals():
+            if "job_id" in locals():
                 await job_store.update_status(job_id, "error", error=str(exc))
                 await job_store.publish_result(
                     job_id,
                     {"status": "error", "request_id": job_id, "error": str(exc)},
                 )
-                await save_log({
-                    "request_id": job_id,
-                    "status": "error",
-                    "error": str(exc),
-                    "timestamp": time.time(),
-                })
+                await save_log(
+                    {
+                        "request_id": job_id,
+                        "status": "error",
+                        "error": str(exc),
+                        "timestamp": time.time(),
+                    }
+                )
         finally:
             if active_incremented:
                 await job_store.decrement_active()
@@ -150,25 +146,29 @@ async def worker_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, http_client, job_store, metrics_sampler, worker_task, metrics_task
+    global \
+        http_client, \
+        job_store, \
+        metrics_sampler, \
+        worker_task, \
+        metrics_task, \
+        cleanup_task
     http_client = await create_http_client()
-    redis_client = await init_redis()
-    job_store = RedisJobStore(redis_client, settings)
-    metrics_sampler = MetricsSampler(redis_client, settings, job_store, http_client)
+    job_store = InMemoryJobStore(settings)
+    metrics_sampler = MetricsSampler(settings, job_store, http_client)
     worker_task = asyncio.create_task(worker_loop())
     metrics_task = asyncio.create_task(metrics_sampler.run())
+    cleanup_task = asyncio.create_task(cleanup_loop())
     try:
         yield
     finally:
-        for task in (worker_task, metrics_task):
+        for task in (worker_task, metrics_task, cleanup_task):
             if task:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
         if http_client:
             await http_client.aclose()
-        if redis_client:
-            await redis_client.close()
 
 
 app = FastAPI(
@@ -217,10 +217,16 @@ async def process_chat_request(
         encrypted_content_b64 = message.get("content", "")
         if isinstance(encrypted_content_b64, str):
             encrypted_content_bytes = base64.b64decode(encrypted_content_b64)
-            decrypted_content = request_fernet.decrypt(encrypted_content_bytes).decode("utf-8")
-            decrypted_messages.append({"role": message.get("role", "user"), "content": decrypted_content})
+            decrypted_content = request_fernet.decrypt(encrypted_content_bytes).decode(
+                "utf-8"
+            )
+            decrypted_messages.append(
+                {"role": message.get("role", "user"), "content": decrypted_content}
+            )
 
-    formatted_prompt_for_tokenisation = format_prompt_for_llm(decrypted_messages, request.model)
+    formatted_prompt_for_tokenisation = format_prompt_for_llm(
+        decrypted_messages, request.model
+    )
     needs_two_step = False
     json_schema = None
     guided_regex = None
@@ -256,9 +262,8 @@ async def process_chat_request(
                 json_schema = {"type": "object"}
                 needs_two_step = True
             elif rf.get("type") == "json_schema":
-                json_schema_obj = (
-                    rf.get("json_schema", {}).get("schema")
-                    or rf.get("schema")
+                json_schema_obj = rf.get("json_schema", {}).get("schema") or rf.get(
+                    "schema"
                 )
                 if json_schema_obj:
                     json_schema = json_schema_obj
@@ -337,7 +342,9 @@ async def process_chat_request(
     structured_content_1 = ""
     if isinstance(resp1_json, dict) and resp1_json.get("choices"):
         first_choice = resp1_json["choices"][0]
-        structured_content_1 = first_choice.get("text") or first_choice.get("message", {}).get("content", "")
+        structured_content_1 = first_choice.get("text") or first_choice.get(
+            "message", {}
+        ).get("content", "")
     if not structured_content_1:
         raise ValueError("Guided decoding (step 2) returned no content")
 
@@ -345,7 +352,9 @@ async def process_chat_request(
         f"{thinking_content_1.strip()}\n\nMy final output will therefore be:\n\n{structured_content_1.strip()}"
         f"\n\nWait, have I made a mistake here?\n"
     )
-    prompt_step_3 = base_prompt_for_later_steps + f"<think>\n{correction_thinking_body}\n"
+    prompt_step_3 = (
+        base_prompt_for_later_steps + f"<think>\n{correction_thinking_body}\n"
+    )
 
     thinking_request_2 = {
         "model": request.model,
@@ -374,7 +383,9 @@ async def process_chat_request(
         thinking_correction = thinking_data_2["choices"][0].get("text", "")
 
     thinking_content = f"{correction_thinking_body}\n{thinking_correction}"
-    final_prompt = base_prompt_for_later_steps + f"<think>\n{thinking_content}</think>\n"
+    final_prompt = (
+        base_prompt_for_later_steps + f"<think>\n{thinking_content}</think>\n"
+    )
 
     guided_request = {
         "model": request.model,
@@ -452,9 +463,9 @@ async def websocket_completions(websocket: WebSocket):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     await websocket.accept()
-    active_connections_key = "llm:ws:connections"
-    assert redis_client is not None and job_store is not None
-    await redis_client.incr(active_connections_key)
+    assert job_store is not None
+    pending_jobs: set[str] = set()
+    await job_store.increment_ws_connections()
 
     try:
         while True:
@@ -472,20 +483,60 @@ async def websocket_completions(websocket: WebSocket):
                 ws_request.request.model_dump(),
                 ws_request.client_request_id,
             )
-            timeout_seconds = int(ws_request.timeout_seconds or settings.job_timeout_seconds)
+            pending_jobs.add(job_id)
+            timeout_seconds = int(
+                ws_request.timeout_seconds or settings.job_timeout_seconds
+            )
+            ping_interval_seconds = 15
+            missed_pongs_allowed = 1
+            missed_pongs = 0
+            deadline = time.time() + timeout_seconds
             try:
-                result = await job_store.wait_for_result(job_id, timeout_seconds)
-                await websocket.send_json(result)
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    wait_for = min(ping_interval_seconds, remaining)
+                    try:
+                        result = await job_store.wait_for_result(job_id, int(wait_for))
+                        await websocket.send_json(result)
+                        pending_jobs.discard(job_id)
+                        break
+                    except asyncio.TimeoutError:
+                        # Application-level ping/pong: send a ping and expect a pong back.
+                        await websocket.send_json(
+                            {"type": "ping", "request_id": job_id}
+                        )
+                        try:
+                            pong = await asyncio.wait_for(
+                                websocket.receive_json(), timeout=ping_interval_seconds
+                            )
+                            if pong.get("type") != "pong":
+                                missed_pongs += 1
+                            else:
+                                missed_pongs = 0
+                        except Exception:
+                            missed_pongs += 1
+                        if missed_pongs > missed_pongs_allowed:
+                            raise asyncio.TimeoutError()
+                        continue
             except asyncio.TimeoutError:
+                pending_jobs.discard(job_id)
+                await job_store.cancel_job(job_id)
                 await websocket.send_json(
-                    {"type": "timeout", "request_id": job_id, "error": "Request timed out"}
+                    {
+                        "type": "timeout",
+                        "request_id": job_id,
+                        "error": "Request timed out",
+                    }
                 )
     except WebSocketDisconnect:
         pass
     finally:
-        new_value = await redis_client.decr(active_connections_key)
-        if new_value < 0:
-            await redis_client.set(active_connections_key, 0)
+        # Cancel any outstanding jobs for this connection
+        for job_id in list(pending_jobs):
+            await job_store.cancel_job(job_id)
+        await job_store.decrement_ws_connections()
 
 
 @app.post("/embeddings")
@@ -520,17 +571,17 @@ async def dashboard_page(request: Request):
 
 @app.get("/dashboard/metrics", response_class=HTMLResponse)
 async def dashboard_metrics(request: Request):
-    assert redis_client is not None
-    metrics_raw = await redis_client.get("llm:metrics:current")
-    chart_raw = await redis_client.get("llm:metrics:chart")
-    metrics_data = json.loads(metrics_raw) if metrics_raw else {"timestamp": "n/a"}
-    chart_data = json.loads(chart_raw) if chart_raw else {
+    metrics_data = {"timestamp": "n/a"}
+    chart_data = {
         "labels": [],
         "avg_gen_throughput": [],
         "gpu_cache_usage": [],
         "memory_usage_percent": [],
         "gpu_utilisation": [],
     }
+    if metrics_sampler and metrics_sampler.latest_metrics:
+        metrics_data = metrics_sampler.latest_metrics.get("current", metrics_data)
+        chart_data = metrics_sampler.latest_metrics.get("chart", chart_data)
     context = {
         "request": request,
         "metrics": metrics_data,
@@ -539,7 +590,19 @@ async def dashboard_metrics(request: Request):
     return templates.TemplateResponse("metrics_partial.html", context)
 
 
-@app.get("/healthz")
+async def cleanup_loop() -> None:
+    """Periodically evict expired jobs/results from memory."""
+    assert job_store is not None
+    interval = max(60, settings.metrics_interval_seconds)  # at least once a minute
+    max_age = settings.job_timeout_seconds
+    while True:
+        try:
+            await job_store.cleanup_expired(max_age_seconds=max_age)
+        except Exception as exc:
+            logging.getLogger("custom_vllm.cleanup").warning("Cleanup error: %s", exc)
+        await asyncio.sleep(interval)
+
+
+@app.get("/health")
 async def health_check():
     return {"status": "ok"}
-
