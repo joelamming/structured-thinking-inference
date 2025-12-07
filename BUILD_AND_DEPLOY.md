@@ -1,6 +1,6 @@
 ## Build and deploy (orchestrator + vLLM) without local Docker on target
 
-This guide shows how to build the orchestrator image on a build box (e.g. EC2), push it to a registry run it on a platform like RunPod or ECS. This avoids Docker-in-Docker on some GPU-as-a-Service vendors.
+This guide shows how to build the orchestrator image on a build box (e.g. EC2), push it to a registry run it on a platform like RunPod or ECS. This avoids Docker-in-Docker quirks on some GPU-as-a-Service vendors.
 
 ### Prerequisites
 - A Linux/x86_64 build machine with Docker/Buildx (Ubuntu/AL2 is fine; build with `--platform=linux/amd64`).
@@ -65,12 +65,12 @@ HF_TOKEN=...                          # only for gated models
 TENSOR_PARALLEL=1                     # adjust for GPU count
 ```
 
-### 6) Deploy on RunPod (single container)
+### 6) Deploy on CaaS (single container)
 - Set container image to your pushed orchestrator tag (e.g., `$REG/orchestrator:latest`).
 - If the image is private, add registry auth (PAT/IAM). Or set package to public in GHCR.
 - Expose port `8005` (HTTP/WebSocket).
 - Provide env vars above. No external Redis is required; state is in-memory and resets on container restart.
-- GPU: enable the RunPod GPU toggle so `vllm serve` can see the device.
+- GPU: enable the CaaS vendor GPU toggle so `vllm serve` can see the device.
 
 ### 7) Deploy on ECS (task definition outline)
 - Single container in the task:
@@ -87,5 +87,5 @@ TENSOR_PARALLEL=1                     # adjust for GPU count
 
 ### 9) Tips
 - Pin images by digest for stability: `$REG/orchestrator@sha256:<digest>`.
-- Keep PATs secret; avoid putting them in env vars—use platform registry auth.
-- Keep the GHCR package public if you don’t want to manage auth on RunPod.
+- Keep PATs secret, avoid putting them in env vars, use platform registry auth.
+- Keep the GHCR package public if you don’t want to manage auth on CaaS platform.

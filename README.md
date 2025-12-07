@@ -9,7 +9,7 @@ Public-facing implementation
 
 ## Required envs
 
-Export secrets via your runner (e.g. RunPod env vars) before starting the container:
+Export secrets via your runner (e.g. ECS or RunPod env vars) before starting the container:
 
 ```
 export ORCH_API_KEY=...
