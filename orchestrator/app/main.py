@@ -4,7 +4,8 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
+import os
 
 import aiofiles
 import httpx
@@ -36,6 +37,15 @@ logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+
+THINKING_EFFORT_BUDGETS = {
+    "none": 0,
+    "low": 500,
+    "medium": 2000,
+    "high": 16000,
+}
+CUTOFF_NOTICE = "...\nTime's up; here's the answer."
+FINAL_MAX_TOKENS = int(os.getenv("FINAL_MAX_TOKENS"))
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 file_log_lock = asyncio.Lock()
@@ -199,6 +209,59 @@ def format_prompt_for_llm(messages: List[Dict[str, str]], model_name: str) -> st
     raise ValueError(f"Unknown model type '{model_name}' for custom prompt formatting.")
 
 
+def derive_thinking_budget(effort: str) -> int:
+    return THINKING_EFFORT_BUDGETS.get(effort, THINKING_EFFORT_BUDGETS["medium"])
+
+
+async def run_thinking_prompt(
+    prompt: str,
+    request: ChatRequest,
+    job_id: str,
+    client_request_id: Optional[str],
+    request_suffix: str,
+    max_tokens: int,
+) -> Tuple[str, str]:
+    """
+    Run a single thinking completion with a dedicated budget.
+
+    Returns the thinking text and the finish_reason.
+    """
+    assert http_client is not None
+    thinking_request = {
+        "model": request.model,
+        "prompt": prompt,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "stop": ["</think>"],
+        "repetition_penalty": request.repetition_penalty,
+    }
+    thinking_response = await http_client.post(
+        settings.llm_server_url,
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-ID": f"{job_id}-{request_suffix}",
+            "X-Client-Request-ID": client_request_id or "none",
+        },
+        json=thinking_request,
+        timeout=None,
+    )
+    thinking_response.raise_for_status()
+    thinking_data = thinking_response.json()
+    thinking_text = ""
+    finish_reason = "stop"
+    if "choices" in thinking_data and thinking_data["choices"]:
+        choice = thinking_data["choices"][0]
+        thinking_text = choice.get("text", "") or ""
+        finish_reason = choice.get("finish_reason", "stop")
+    if finish_reason == "length" and "</think>" not in thinking_text:
+        trimmed = thinking_text.rstrip("\n")
+        prefix = f"{trimmed}\n" if trimmed else ""
+        thinking_text = f"{prefix}{CUTOFF_NOTICE}\n"
+    return thinking_text, finish_reason
+
+
 async def process_chat_request(
     request: ChatRequest,
     job_id: str,
@@ -272,35 +335,24 @@ async def process_chat_request(
     if not needs_two_step:
         raise ValueError("No guided decoding requested")
 
+    effort = getattr(request, "thinking_effort", "medium") or "medium"
+    thinking_budget = derive_thinking_budget(effort)
+    final_max_tokens = FINAL_MAX_TOKENS
     formatted_prompt = formatted_prompt_for_tokenisation
     base_prompt_for_later_steps = formatted_prompt.rsplit("<think>", 1)[0]
 
-    thinking_request = {
-        "model": request.model,
-        "prompt": formatted_prompt,
-        "temperature": request.temperature,
-        "top_p": request.top_p,
-        "max_tokens": request.max_tokens,
-        "stream": False,
-        "stop": ["</think>"],
-        "repetition_penalty": request.repetition_penalty,
-    }
     completions_single_url = completions_url
-    thinking_response_1 = await http_client.post(
-        completions_single_url,
-        headers={
-            "Content-Type": "application/json",
-            "X-Request-ID": f"{job_id}-thinking-1",
-            "X-Client-Request-ID": client_request_id or "none",
-        },
-        json=thinking_request,
-        timeout=None,
-    )
-    thinking_response_1.raise_for_status()
-    thinking_data_1 = thinking_response_1.json()
+
     thinking_content_1 = ""
-    if "choices" in thinking_data_1 and thinking_data_1["choices"]:
-        thinking_content_1 = thinking_data_1["choices"][0].get("text", "")
+    if thinking_budget > 0:
+        thinking_content_1, _ = await run_thinking_prompt(
+            formatted_prompt,
+            request,
+            job_id,
+            client_request_id,
+            "thinking-1",
+            thinking_budget,
+        )
 
     prompt_step_2 = formatted_prompt + thinking_content_1 + "</think>\n"
     guided_request_1 = {
@@ -308,7 +360,7 @@ async def process_chat_request(
         "prompt": prompt_step_2,
         "temperature": 0.0,
         "top_p": request.top_p,
-        "max_tokens": request.max_tokens,
+        "max_tokens": final_max_tokens,
         "stream": False,
         "repetition_penalty": request.repetition_penalty,
     }
@@ -348,6 +400,34 @@ async def process_chat_request(
     if not structured_content_1:
         raise ValueError("Guided decoding (step 2) returned no content")
 
+    if effort == "none":
+        isolated_response_data = json.loads(json.dumps(resp1_json))
+        if isolated_response_data.get("choices"):
+            choice = isolated_response_data["choices"][0]
+            text_content = choice.get("text") or choice.get("message", {}).get(
+                "content", ""
+            )
+            choice["message"] = {
+                "role": "assistant",
+                "content": text_content or structured_content_1,
+                "thinking": "",
+            }
+            choice["finish_reason"] = choice.get("finish_reason", "stop")
+            choice.pop("text", None)
+
+        if isolated_response_data.get("choices"):
+            message = isolated_response_data["choices"][0]["message"]
+            content_bytes = message["content"].encode("utf-8")
+            encrypted_content = request_fernet.encrypt(content_bytes)
+            message["content"] = base64.b64encode(encrypted_content).decode("ascii")
+            if "thinking" in message and message["thinking"]:
+                thinking_bytes = message["thinking"].encode("utf-8")
+                encrypted_thinking = request_fernet.encrypt(thinking_bytes)
+                message["thinking"] = base64.b64encode(encrypted_thinking).decode(
+                    "ascii"
+                )
+        return isolated_response_data
+
     correction_thinking_body = (
         f"{thinking_content_1.strip()}\n\nMy final output will therefore be:\n\n{structured_content_1.strip()}"
         f"\n\nWait, have I made a mistake here?\n"
@@ -356,31 +436,15 @@ async def process_chat_request(
         base_prompt_for_later_steps + f"<think>\n{correction_thinking_body}\n"
     )
 
-    thinking_request_2 = {
-        "model": request.model,
-        "prompt": prompt_step_3,
-        "temperature": request.temperature,
-        "top_p": request.top_p,
-        "max_tokens": request.max_tokens,
-        "stream": False,
-        "stop": ["</think>"],
-        "repetition_penalty": request.repetition_penalty,
-    }
-    thinking_response_2 = await http_client.post(
-        completions_single_url,
-        headers={
-            "Content-Type": "application/json",
-            "X-Request-ID": f"{job_id}-thinking-2",
-            "X-Client-Request-ID": client_request_id or "none",
-        },
-        json=thinking_request_2,
-        timeout=None,
-    )
-    thinking_response_2.raise_for_status()
-    thinking_data_2 = thinking_response_2.json()
     thinking_correction = ""
-    if "choices" in thinking_data_2 and thinking_data_2["choices"]:
-        thinking_correction = thinking_data_2["choices"][0].get("text", "")
+    thinking_correction, _ = await run_thinking_prompt(
+        prompt_step_3,
+        request,
+        job_id,
+        client_request_id,
+        "thinking-2",
+        thinking_budget,
+    )
 
     thinking_content = f"{correction_thinking_body}\n{thinking_correction}"
     final_prompt = (
@@ -392,7 +456,7 @@ async def process_chat_request(
         "prompt": final_prompt,
         "temperature": 0.0,
         "top_p": request.top_p,
-        "max_tokens": request.max_tokens,
+        "max_tokens": final_max_tokens,
         "stream": False,
         "repetition_penalty": request.repetition_penalty,
     }

@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -8,7 +8,7 @@ class ChatRequest(BaseModel):
     model: str = Field(..., min_length=1, description="Model name is required.")
     temperature: float = 0.6
     top_p: float = 0.95
-    max_tokens: int = 128
+    thinking_effort: Literal["none", "low", "medium", "high"] = "medium"
     stop: Optional[List[str]] = None
     extra_body: Optional[Dict[str, Any]] = None
     response_format: Optional[Dict[str, Any]] = None
@@ -20,6 +20,15 @@ class ChatRequest(BaseModel):
         if not v or not v.strip():
             raise ValueError("Model name must be provided")
         return v
+
+    @field_validator("thinking_effort")
+    @classmethod
+    def normalise_thinking_effort(cls, v: str) -> str:
+        allowed = {"none", "low", "medium", "high"}
+        value = v.lower()
+        if value not in allowed:
+            raise ValueError(f"thinking_effort must be one of {sorted(allowed)}")
+        return value
 
 
 class EmbeddingRequest(BaseModel):
