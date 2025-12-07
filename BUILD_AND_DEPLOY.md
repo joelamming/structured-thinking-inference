@@ -8,6 +8,30 @@ This guide shows how to build the orchestrator image on a build box (e.g. EC2), 
 - Git installed.
 - Hugging Face token for vLLM (`HF_TOKEN`) and your model name (`MODEL_NAME`), sometimes needed for gated models.
 
+### 0) Remote into the build machine
+```bash
+ssh -i <path_to_yer_keys_mate> ec2-user@ec2-<ip-address>.eu-west-2.compute.amazonaws.com
+
+# Install docker and git
+sudo dnf install -y docker git
+
+# Start docker
+sudo systemctl enable --now docker
+
+# Let user run docker without sudo (group created by package)
+sudo usermod -aG docker $USER
+
+# close and reconnect
+
+# multi-arch emulation for buildx
+docker run --privileged --rm tonistiigi/binfmt --install all
+
+# check stuff
+docker --version
+docker buildx version
+docker run --rm hello-world
+```
+
 ### 1) Clone the repo on the build machine
 ```bash
 git clone https://github.com/joelamming/structured-thinking-inference.git
@@ -15,23 +39,23 @@ cd structured-thinking-inference
 ```
 
 ### 2) Log in to your registry
-Pick one -- I used GHCR:
+Pick one -- I used GHCR with `gh_user=joelamming`:
 - **GHCR (classic PAT with write/read:packages):**
-  ```bash
-  echo "$PAT" | docker login ghcr.io -u <gh_user> --password-stdin
-  export REG=ghcr.io/<gh_user>/structured-thinking-inference
-  ```
+```bash
+echo "$PAT" | docker login ghcr.io -u <gh_user> --password-stdin
+export REG=ghcr.io/<gh_user>/structured-thinking-inference
+```
 - **Docker Hub (personal access token or password):**
-  ```bash
-  echo "$HUB_TOKEN" | docker login -u <hub_user> --password-stdin
-  export REG=docker.io/<hub_user>/structured-thinking-inference
-  ```
+```bash
+echo "$HUB_TOKEN" | docker login -u <hub_user> --password-stdin
+export REG=docker.io/<hub_user>/structured-thinking-inference
+```
 - **ECR (IAM):**
-  ```bash
-  aws ecr get-login-password --region <region> \
-    | docker login --username AWS --password-stdin <acct>.dkr.ecr.<region>.amazonaws.com
-  export REG=<acct>.dkr.ecr.<region>.amazonaws.com/structured-thinking-inference
-  ```
+```bash
+aws ecr get-login-password --region <region> \
+  | docker login --username AWS --password-stdin <acct>.dkr.ecr.<region>.amazonaws.com
+export REG=<acct>.dkr.ecr.<region>.amazonaws.com/structured-thinking-inference
+```
 
 ### 3) Build and push the single image (linux/amd64)
 ```bash

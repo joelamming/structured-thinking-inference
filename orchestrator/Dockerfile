@@ -1,4 +1,4 @@
-FROM ghcr.io/vllm-project/vllm-openai:latest
+FROM docker.io/vllm/vllm-openai:latest
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
