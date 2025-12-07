@@ -23,5 +23,6 @@ RUN mkdir -p /app/logs
 
 EXPOSE 8000 8005
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/orchestrator.conf"]
+# Override base image entrypoint so we own process supervision
+ENTRYPOINT ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/orchestrator.conf"]
 

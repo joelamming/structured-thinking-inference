@@ -11,7 +11,10 @@ This guide shows how to build the orchestrator image on a build box (e.g. EC2), 
 ### 0) Remote into the build machine
 ```bash
 ssh -i <path_to_yer_keys_mate> ec2-user@ec2-<ip-address>.eu-west-2.compute.amazonaws.com
+```
 
+### 1) Setup and clone the repo
+```bash
 # Install docker and git
 sudo dnf install -y docker git
 
@@ -30,10 +33,7 @@ docker run --privileged --rm tonistiigi/binfmt --install all
 docker --version
 docker buildx version
 docker run --rm hello-world
-```
 
-### 1) Clone the repo on the build machine
-```bash
 git clone https://github.com/joelamming/structured-thinking-inference.git
 cd structured-thinking-inference
 ```
@@ -62,20 +62,20 @@ export REG=<acct>.dkr.ecr.<region>.amazonaws.com/structured-thinking-inference
 docker buildx create --use --name builder || docker buildx use builder
 TAG=$(git rev-parse --short HEAD)
 docker buildx build --platform=linux/amd64 \
-  -t $REG/orchestrator:latest \
-  -t $REG/orchestrator:$TAG \
+  -t $REG:latest \
+  -t $REG:$TAG \
   -f orchestrator/Dockerfile \
   --push .
 ```
 
 ### 4) Runtime images
-- Single container image: the image you just built (contains vLLM server + orchestrator under `supervisord`).
+- Single container image: the image we just built (contains vLLM server + orchestrator under `supervisord`).
 
 ### 5) Required environment variables (orchestrator)
 ```
 ORCH_API_KEY=...               # required
 ORCH_ENCRYPTION_KEY=...        # 32-byte Fernet key, base64; generate via e.g:
-# python - <<'PY'
+# python3 - <<'PY'
 # from cryptography.fernet import Fernet
 # print(Fernet.generate_key().decode())
 # PY
