@@ -38,3 +38,13 @@ docker compose up -d orchestrator
 ```
 
 Redis data is transient by design; restarts clear pending jobs and metrics snapshots.
+
+## How the two-pass thinking + structured decoding works
+
+- Requests carry `thinking_effort` (`none/low/medium/high`) to size the thinking budget, final answers use a separate fixed token cap.
+- We always format the prompt with `<think>` for Qwen-style reasoning. For `none`, we prefill an empty think and skip extra thinking.
+- Step 1: run a thinking call (unless `none`) with a cap -- if it overruns without `</think>` we append a brief cutoff notice.
+- Step 2: first guided decode with `structured_outputs` to produce a draft structured answer.
+- Step 3: build a correction think that embeds the draft plus “Wait, have I made a mistake?” and run another thinking pass with the same budget (for high effort this can be looong!).
+- Step 4: final guided decode, again with `structured_outputs`, using the full combined thinking so the model can revise and still satisfy the schema/regex/choice/grammar.
+- This flow maximises adherence to structured outputs while giving the model a chance to self-correct without exhausting the final answer budget.

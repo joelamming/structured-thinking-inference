@@ -291,45 +291,26 @@ async def process_chat_request(
         decrypted_messages, request.model
     )
     needs_two_step = False
-    json_schema = None
-    guided_regex = None
-    guided_choice = None
-    guided_grammar = None
-    guided_decoding_backend = None
-    structural_tag = None
+    structured_outputs = None
 
     if request.extra_body:
         extra = request.extra_body
-        if "guided_json" in extra:
-            json_schema = extra["guided_json"]
-            needs_two_step = True
-        if "guided_regex" in extra:
-            guided_regex = extra["guided_regex"]
-            needs_two_step = True
-        if "guided_choice" in extra:
-            guided_choice = extra["guided_choice"]
-            needs_two_step = True
-        if "guided_grammar" in extra:
-            guided_grammar = extra["guided_grammar"]
-            needs_two_step = True
-        if "guided_decoding_backend" in extra:
-            guided_decoding_backend = extra["guided_decoding_backend"]
-        if "structural_tag" in extra:
-            structural_tag = extra["structural_tag"]
+        if "structured_outputs" in extra:
+            structured_outputs = extra["structured_outputs"]
             needs_two_step = True
 
-    if not json_schema and request.response_format:
+    if not structured_outputs and request.response_format:
         rf = request.response_format
         if isinstance(rf, dict):
             if rf.get("type") == "json_object":
-                json_schema = {"type": "object"}
+                structured_outputs = {"json": {"type": "object"}}
                 needs_two_step = True
             elif rf.get("type") == "json_schema":
                 json_schema_obj = rf.get("json_schema", {}).get("schema") or rf.get(
                     "schema"
                 )
                 if json_schema_obj:
-                    json_schema = json_schema_obj
+                    structured_outputs = {"json": json_schema_obj}
                     needs_two_step = True
 
     if not needs_two_step:
@@ -366,18 +347,13 @@ async def process_chat_request(
     }
     if request.stop:
         guided_request_1["stop"] = request.stop
-    if json_schema:
-        guided_request_1["guided_json"] = json_schema
-    if guided_regex:
-        guided_request_1["guided_regex"] = guided_regex
-    if guided_choice:
-        guided_request_1["guided_choice"] = guided_choice
-    if guided_grammar:
-        guided_request_1["guided_grammar"] = guided_grammar
-    if structural_tag:
-        guided_request_1["structural_tag"] = structural_tag
-    if guided_decoding_backend:
-        guided_request_1["guided_decoding_backend"] = guided_decoding_backend
+    if structured_outputs:
+        guided_request_1["structured_outputs"] = structured_outputs
+        if "regex" in structured_outputs:
+            if "stop" not in guided_request_1 or not guided_request_1["stop"]:
+                guided_request_1["stop"] = ["</s>"]
+            elif "</s>" not in guided_request_1["stop"]:
+                guided_request_1["stop"].append("</s>")
 
     response_1 = await http_client.post(
         completions_single_url,
@@ -462,22 +438,13 @@ async def process_chat_request(
     }
     if request.stop:
         guided_request["stop"] = request.stop
-    if json_schema:
-        guided_request["guided_json"] = json_schema
-    if guided_regex:
-        guided_request["guided_regex"] = guided_regex
-        if "stop" not in guided_request or not guided_request["stop"]:
-            guided_request["stop"] = ["</s>"]
-        elif "</s>" not in guided_request["stop"]:
-            guided_request["stop"].append("</s>")
-    if guided_choice:
-        guided_request["guided_choice"] = guided_choice
-    if guided_grammar:
-        guided_request["guided_grammar"] = guided_grammar
-    if structural_tag:
-        guided_request["structural_tag"] = structural_tag
-    if guided_decoding_backend:
-        guided_request["guided_decoding_backend"] = guided_decoding_backend
+    if structured_outputs:
+        guided_request["structured_outputs"] = structured_outputs
+        if "regex" in structured_outputs:
+            if "stop" not in guided_request or not guided_request["stop"]:
+                guided_request["stop"] = ["</s>"]
+            elif "</s>" not in guided_request["stop"]:
+                guided_request["stop"].append("</s>")
 
     response = await http_client.post(
         completions_single_url,
