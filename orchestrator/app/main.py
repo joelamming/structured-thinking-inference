@@ -489,84 +489,247 @@ async def process_chat_request(
 
 @app.websocket("/ws/completions")
 async def websocket_completions(websocket: WebSocket):
+    """
+    WebSocket endpoint for completion requests.
+
+    Architecture: Uses concurrent tasks for robust keepalive handling:
+    - receiver_task: Receives all client messages and routes them appropriately
+    - keepalive_task: Sends periodic pings and monitors client activity
+    - Main loop: Processes job results and sends them to the client
+
+    This avoids blocking receives that compete for messages and ensures
+    keepalive pings don't interfere with request/response handling.
+    """
     api_key = websocket.headers.get("X-API-Key")
     if api_key != settings.api_key:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     await websocket.accept()
     assert job_store is not None
-    pending_jobs: set[str] = set()
     await job_store.increment_ws_connections()
 
-    try:
-        while True:
-            message = await websocket.receive_text()
-            try:
-                payload = json.loads(message)
-                ws_request = CompletionWebSocketRequest.model_validate(payload)
-            except Exception as exc:
-                await websocket.send_json(
-                    {"type": "error", "error": f"Invalid payload: {str(exc)}"}
-                )
-                continue
+    # Shared state for concurrent tasks
+    pending_jobs: dict[str, float] = {}  # job_id -> deadline timestamp
+    incoming_requests: asyncio.Queue[dict] = asyncio.Queue()
+    connection_alive = True
+    last_client_activity = time.time()
+    shutdown_event = asyncio.Event()
 
-            job_id = await job_store.enqueue_job(
-                ws_request.request.model_dump(),
-                ws_request.client_request_id,
-            )
-            pending_jobs.add(job_id)
-            timeout_seconds = int(
-                ws_request.timeout_seconds or settings.job_timeout_seconds
-            )
-            ping_interval_seconds = 15
-            missed_pongs_allowed = 1
-            missed_pongs = 0
-            deadline = time.time() + timeout_seconds
-            try:
-                while True:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError()
-                    wait_for = min(ping_interval_seconds, remaining)
+    # Keepalive configuration
+    ping_interval_seconds = 15
+    # Allow some missed pings but also check activity - if we've received any
+    # message recently, the connection is healthy even without explicit pongs
+    activity_timeout_seconds = ping_interval_seconds * 3  # 45s of inactivity = dead
+
+    async def receiver_task():
+        """
+        Receive all messages from the client and route them.
+        Runs until connection closes or shutdown is signaled.
+        """
+        nonlocal connection_alive, last_client_activity
+        try:
+            while connection_alive and not shutdown_event.is_set():
+                try:
+                    message = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=1.0,  # Short timeout to check shutdown_event
+                    )
+                    last_client_activity = time.time()
                     try:
-                        result = await job_store.wait_for_result(job_id, int(wait_for))
-                        await websocket.send_json(result)
-                        pending_jobs.discard(job_id)
-                        break
-                    except asyncio.TimeoutError:
-                        # Application-level ping/pong: send a ping and expect a pong back.
-                        await websocket.send_json(
-                            {"type": "ping", "request_id": job_id}
-                        )
+                        payload = json.loads(message)
+                        msg_type = payload.get("type")
+
+                        if msg_type == "pong":
+                            # Pong received - activity already updated above
+                            continue
+                        elif msg_type == "cancel":
+                            # Client wants to cancel a job
+                            cancel_job_id = payload.get("request_id")
+                            if cancel_job_id and cancel_job_id in pending_jobs:
+                                await job_store.cancel_job(cancel_job_id)
+                                pending_jobs.pop(cancel_job_id, None)
+                            continue
+                        else:
+                            # Assume it's a completion request
+                            await incoming_requests.put(payload)
+                    except json.JSONDecodeError as exc:
+                        logger.warning("Invalid JSON from client: %s", exc)
                         try:
-                            pong = await asyncio.wait_for(
-                                websocket.receive_json(), timeout=ping_interval_seconds
+                            await websocket.send_json(
+                                {"type": "error", "error": f"Invalid JSON: {exc}"}
                             )
-                            if pong.get("type") != "pong":
-                                missed_pongs += 1
-                            else:
-                                missed_pongs = 0
                         except Exception:
-                            missed_pongs += 1
-                        if missed_pongs > missed_pongs_allowed:
-                            raise asyncio.TimeoutError()
-                        continue
-            except asyncio.TimeoutError:
-                pending_jobs.discard(job_id)
+                            pass
+                except asyncio.TimeoutError:
+                    # No message received, just loop to check shutdown_event
+                    continue
+        except WebSocketDisconnect:
+            logger.debug("WebSocket disconnected in receiver")
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Receiver task error: %s", exc)
+        finally:
+            connection_alive = False
+
+    async def keepalive_task():
+        """
+        Send periodic pings and monitor client activity.
+        Closes connection if client appears dead.
+        """
+        nonlocal connection_alive
+        try:
+            while connection_alive and not shutdown_event.is_set():
+                await asyncio.sleep(ping_interval_seconds)
+                if shutdown_event.is_set() or not connection_alive:
+                    break
+
+                # Check if we've had any activity recently
+                time_since_activity = time.time() - last_client_activity
+                if time_since_activity > activity_timeout_seconds:
+                    logger.warning(
+                        "No client activity for %.1fs, closing connection",
+                        time_since_activity,
+                    )
+                    connection_alive = False
+                    break
+
+                # Send application-level ping
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception as exc:
+                    logger.debug("Failed to send ping: %s", exc)
+                    connection_alive = False
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Keepalive task error: %s", exc)
+            connection_alive = False
+
+    async def result_waiter_task(job_id: str, timeout_seconds: int):
+        """Wait for a job result and return it, or None if timed out/cancelled."""
+        try:
+            result = await job_store.wait_for_result(job_id, timeout_seconds)
+            return result
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            return None
+
+    # Start background tasks
+    receiver = asyncio.create_task(receiver_task())
+    keepalive = asyncio.create_task(keepalive_task())
+    active_waiters: dict[str, asyncio.Task] = {}  # job_id -> waiter task
+
+    try:
+        while connection_alive:
+            # Process incoming requests (non-blocking check)
+            try:
+                payload = incoming_requests.get_nowait()
+                try:
+                    ws_request = CompletionWebSocketRequest.model_validate(payload)
+                    job_id = await job_store.enqueue_job(
+                        ws_request.request.model_dump(),
+                        ws_request.client_request_id,
+                    )
+                    timeout_seconds = int(
+                        ws_request.timeout_seconds or settings.job_timeout_seconds
+                    )
+                    pending_jobs[job_id] = time.time() + timeout_seconds
+                    # Start a waiter task for this job
+                    active_waiters[job_id] = asyncio.create_task(
+                        result_waiter_task(job_id, timeout_seconds)
+                    )
+                except Exception as exc:
+                    logger.warning("Invalid request payload: %s", exc)
+                    try:
+                        await websocket.send_json(
+                            {"type": "error", "error": f"Invalid payload: {exc}"}
+                        )
+                    except Exception:
+                        pass
+            except asyncio.QueueEmpty:
+                pass
+
+            # Check for completed job waiters
+            completed_waiters = [
+                jid for jid, task in active_waiters.items() if task.done()
+            ]
+            for job_id in completed_waiters:
+                task = active_waiters.pop(job_id)
+                pending_jobs.pop(job_id, None)
+                try:
+                    result = task.result()
+                    if result is not None:
+                        await websocket.send_json(result)
+                    else:
+                        # Timed out
+                        await job_store.cancel_job(job_id)
+                        await websocket.send_json(
+                            {
+                                "type": "timeout",
+                                "request_id": job_id,
+                                "error": "Request timed out",
+                            }
+                        )
+                except asyncio.CancelledError:
+                    await job_store.cancel_job(job_id)
+                except Exception as exc:
+                    logger.warning("Error processing job result: %s", exc)
+
+            # Check for jobs that have exceeded their deadline
+            now = time.time()
+            expired_jobs = [
+                jid for jid, deadline in pending_jobs.items() if now > deadline
+            ]
+            for job_id in expired_jobs:
+                pending_jobs.pop(job_id, None)
+                if job_id in active_waiters:
+                    active_waiters[job_id].cancel()
+                    active_waiters.pop(job_id, None)
                 await job_store.cancel_job(job_id)
-                await websocket.send_json(
-                    {
-                        "type": "timeout",
-                        "request_id": job_id,
-                        "error": "Request timed out",
-                    }
-                )
-    except WebSocketDisconnect:
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "timeout",
+                            "request_id": job_id,
+                            "error": "Request timed out",
+                        }
+                    )
+                except Exception:
+                    pass
+
+            # Brief sleep to prevent busy-loop
+            await asyncio.sleep(0.1)
+
+    except (WebSocketDisconnect, asyncio.CancelledError):
         pass
+    except Exception as exc:
+        logger.exception("WebSocket handler error: %s", exc)
     finally:
-        # Cancel any outstanding jobs for this connection
-        for job_id in list(pending_jobs):
+        # Signal shutdown and clean up
+        shutdown_event.set()
+        connection_alive = False
+
+        # Cancel background tasks
+        receiver.cancel()
+        keepalive.cancel()
+        for task in active_waiters.values():
+            task.cancel()
+
+        with suppress(asyncio.CancelledError):
+            await receiver
+        with suppress(asyncio.CancelledError):
+            await keepalive
+        for task in active_waiters.values():
+            with suppress(asyncio.CancelledError):
+                await task
+
+        # Cancel any outstanding jobs
+        for job_id in list(pending_jobs.keys()):
             await job_store.cancel_job(job_id)
+
         await job_store.decrement_ws_connections()
 
 
