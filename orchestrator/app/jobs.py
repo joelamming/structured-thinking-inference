@@ -3,7 +3,7 @@ import json
 import time
 from typing import Any, Dict, Optional, Tuple
 from uuid import uuid4
-from .config import Settings
+from orchestrator.app.config import Settings
 
 
 class InMemoryJobStore:

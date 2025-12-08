@@ -7,8 +7,8 @@ from collections import deque
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from .config import Settings
-from .jobs import InMemoryJobStore
+from orchestrator.app.config import Settings
+from orchestrator.app.jobs import InMemoryJobStore
 
 
 METRIC_LINE_RE = re.compile(
@@ -159,7 +159,7 @@ class MetricsSampler:
         ws_connections = counters["websocket_connections"]
 
         current_timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        current_metrics = {
+        current_metrics: Dict[str, Any] = {
             "timestamp": current_timestamp,
             "queue_depth": queue_depth,
             "active_jobs": active_jobs,
@@ -184,16 +184,19 @@ class MetricsSampler:
         # Update chart series
         self.chart_labels.append(datetime.utcnow().strftime("%H:%M:%S"))
         self.chart_avg_gen_throughput.append(
-            current_metrics.get("vllm:avg_generation_throughput_toks_per_s", 0.0)
+            float(
+                current_metrics.get("vllm:avg_generation_throughput_toks_per_s", 0.0)
+                or 0.0
+            )
         )
         self.chart_gpu_cache_usage.append(
-            current_metrics.get("vllm:gpu_cache_usage_perc", 0.0)
+            float(current_metrics.get("vllm:gpu_cache_usage_perc", 0.0) or 0.0)
         )
         self.chart_memory_usage_percent.append(
-            current_metrics.get("memory_usage_percent", 0.0)
+            float(current_metrics.get("memory_usage_percent", 0.0) or 0.0)
         )
         self.chart_gpu_utilisation.append(
-            current_metrics.get("gpu_utilisation_percent", 0.0)
+            float(current_metrics.get("gpu_utilisation_percent", 0.0) or 0.0)
         )
 
         chart_data = {

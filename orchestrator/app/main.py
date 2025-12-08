@@ -4,10 +4,10 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple, TypedDict, cast
 import os
 
-import aiofiles
+import aiofiles  # type: ignore[import-untyped]
 import httpx
 from cryptography.fernet import Fernet
 from fastapi import (
@@ -25,10 +25,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from httpx import Timeout
 
-from .config import get_settings, Settings
-from .jobs import InMemoryJobStore
-from .metrics import MetricsSampler
-from .models import EmbeddingRequest, ChatRequest, CompletionWebSocketRequest
+from orchestrator.app.config import get_settings, Settings
+from orchestrator.app.jobs import InMemoryJobStore
+from orchestrator.app.metrics import MetricsSampler
+from orchestrator.app.models import (
+    EmbeddingRequest,
+    ChatRequest,
+    CompletionWebSocketRequest,
+)
 
 
 settings: Settings = get_settings()
@@ -45,7 +49,7 @@ THINKING_EFFORT_BUDGETS = {
     "high": 16000,
 }
 CUTOFF_NOTICE = "...\nTime's up; here's the answer."
-FINAL_MAX_TOKENS = int(os.getenv("FINAL_MAX_TOKENS"))
+FINAL_MAX_TOKENS = int(os.getenv("FINAL_MAX_TOKENS") or "0")
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 file_log_lock = asyncio.Lock()
@@ -291,12 +295,12 @@ async def process_chat_request(
         decrypted_messages, request.model
     )
     needs_two_step = False
-    structured_outputs = None
+    structured_outputs: Optional[Dict[str, Any]] = None
 
     if request.extra_body:
         extra = request.extra_body
         if "structured_outputs" in extra:
-            structured_outputs = extra["structured_outputs"]
+            structured_outputs = cast(Dict[str, Any], extra["structured_outputs"])
             needs_two_step = True
 
     if not structured_outputs and request.response_format:
@@ -336,7 +340,7 @@ async def process_chat_request(
         )
 
     prompt_step_2 = formatted_prompt + thinking_content_1 + "</think>\n"
-    guided_request_1 = {
+    guided_request_1: Dict[str, Any] = {
         "model": request.model,
         "prompt": prompt_step_2,
         "temperature": 0.0,
@@ -427,7 +431,7 @@ async def process_chat_request(
         base_prompt_for_later_steps + f"<think>\n{thinking_content}</think>\n"
     )
 
-    guided_request = {
+    guided_request: Dict[str, Any] = {
         "model": request.model,
         "prompt": final_prompt,
         "temperature": 0.0,
@@ -763,19 +767,30 @@ async def dashboard_page(request: Request):
     return templates.TemplateResponse("dashboard.html", {"request": request})
 
 
+class ChartData(TypedDict):
+    labels: List[str]
+    avg_gen_throughput: List[float]
+    gpu_cache_usage: List[float]
+    memory_usage_percent: List[float]
+    gpu_utilisation: List[float]
+
+
 @app.get("/dashboard/metrics", response_class=HTMLResponse)
 async def dashboard_metrics(request: Request):
-    metrics_data = {"timestamp": "n/a"}
-    chart_data = {
+    metrics_data: Dict[str, Any] = {"timestamp": "n/a"}
+    empty_chart: ChartData = {
         "labels": [],
         "avg_gen_throughput": [],
         "gpu_cache_usage": [],
         "memory_usage_percent": [],
         "gpu_utilisation": [],
     }
+    chart_data: ChartData = empty_chart
     if metrics_sampler and metrics_sampler.latest_metrics:
         metrics_data = metrics_sampler.latest_metrics.get("current", metrics_data)
-        chart_data = metrics_sampler.latest_metrics.get("chart", chart_data)
+        chart_data = cast(
+            ChartData, metrics_sampler.latest_metrics.get("chart", empty_chart)
+        )
     context = {
         "request": request,
         "metrics": metrics_data,
