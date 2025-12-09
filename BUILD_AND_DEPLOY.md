@@ -6,14 +6,14 @@ This guide shows how to build the orchestrator image on a build box (e.g. EC2), 
 - A Linux/x86_64 build machine with Docker/Buildx (Ubuntu/AL2 is fine; build with `--platform=linux/amd64`).
 - A container registry (GHCR, Docker Hub or ECR).
 - Git installed.
-- Hugging Face token for vLLM (`HF_TOKEN`) and your model name (`MODEL_NAME`), sometimes needed for gated models.
+- Hugging Face token for vLLM (`HF_TOKEN`) and model name (`MODEL_NAME`), sometimes needed for gated models.
 
-### 0) Remote into the build machine
+### 0. Remote into the build machine
 ```bash
 ssh -i <path_to_yer_keys_mate> ec2-user@ec2-<ip-address>.eu-west-2.compute.amazonaws.com
 ```
 
-### 1) Setup and clone the repo
+### 1. Setup and clone the repo
 ```bash
 # Install docker and git
 sudo dnf install -y docker git
@@ -38,7 +38,7 @@ git clone https://github.com/joelamming/structured-thinking-inference.git
 cd structured-thinking-inference
 ```
 
-### 2) Log in to your registry
+### 2. Log in to your registry
 Pick one -- I used GHCR with `gh_user=joelamming`:
 - **GHCR (classic PAT with write/read:packages):**
 ```bash
@@ -57,7 +57,7 @@ aws ecr get-login-password --region <region> \
 export REG=<acct>.dkr.ecr.<region>.amazonaws.com/structured-thinking-inference
 ```
 
-### 3) Build and push the single image (linux/amd64)
+### 3. Build and push the single image (linux/amd64)
 ```bash
 docker buildx create --use --name builder || docker buildx use builder
 TAG=$(git rev-parse --short HEAD)
@@ -68,10 +68,10 @@ docker buildx build --platform=linux/amd64 \
   --push .
 ```
 
-### 4) Runtime images
+### 4. Runtime images
 - Single container image: the image we just built (contains vLLM server + orchestrator under `supervisord`).
 
-### 5) Required environment variables (orchestrator)
+### 5. Required environment variables (orchestrator)
 ```
 ORCH_API_KEY=...               # required
 ORCH_ENCRYPTION_KEY=...        # 32-byte Fernet key, base64; generate via e.g:
@@ -89,27 +89,21 @@ HF_TOKEN=...                          # only for gated models
 TENSOR_PARALLEL=1                     # adjust for GPU count
 ```
 
-### 6) Deploy on CaaS (single container)
+### 6. Deploy on CaaS (single container)
 - Set container image to your pushed orchestrator tag (e.g., `$REG/orchestrator:latest`).
 - If the image is private, add registry auth (PAT/IAM). Or set package to public in GHCR.
 - Expose port `8005` (HTTP/WebSocket).
-- Provide env vars above. No external Redis is required; state is in-memory and resets on container restart.
+- Provide env vars above; state is in-memory and resets on container restart.
 - GPU: enable the CaaS vendor GPU toggle so `vllm serve` can see the device.
 
-### 7) Deploy on ECS (task definition outline)
+### 7. Deploy on ECS (task definition outline)
 - Single container in the task:
   - Image `$REG/orchestrator:latest`
   - Port 8005 exposed
   - Env vars above (MODEL_NAME/HF_TOKEN/TENSOR_PARALLEL for vLLM; ORCH_* for FastAPI)
-- Assign a GPU to the task definition; no sidecar Redis needed.
 
-### 8) Testing
+### 8. Testing
 - Orchestrator health: `GET http://<orchestrator-host>:8005/health`
 - Dashboard: `http://<orchestrator-host>:8005/dashboard`
 - OpenAPI docs: `http://<orchestrator-host>:8005/docs`
 - Completions: WebSocket at `ws://<host>:8005/ws/completions` (final response over WS)
-
-### 9) Tips
-- Pin images by digest for stability: `$REG/orchestrator@sha256:<digest>`.
-- Keep PATs secret, avoid putting them in env vars, use platform registry auth.
-- Keep the GHCR package public if you don’t want to manage auth on CaaS platform.

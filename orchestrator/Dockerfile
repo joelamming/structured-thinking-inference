@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY orchestrator/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY orchestrator/app /app/app
+COPY orchestrator/app /app/orchestrator/app
 COPY orchestrator/static /app/static
 COPY orchestrator/supervisord.conf /etc/supervisor/conf.d/orchestrator.conf
 RUN mkdir -p /app/logs
