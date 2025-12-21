@@ -1,0 +1,18 @@
+<div id="messages" hx-swap-oob="beforeend">
+    <div class="message assistant">
+        <div class="message-label">Assistant</div>
+        <div class="message-content">{{ content | safe }}</div>
+        {% if thinking %}
+        <div class="thinking">
+            <div class="thinking-header">
+                <span class="thinking-label">Thinking Process</span>
+                <button class="thinking-toggle" onclick="toggleThinking('{{ thinking_id }}')">
+                    Expand ▼
+                </button>
+            </div>
+            <div class="thinking-content collapsed" id="{{ thinking_id }}">{{ thinking }}</div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+

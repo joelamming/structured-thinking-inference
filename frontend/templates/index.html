@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Shitty Vibecoded Chat</title>
+    <title>Thinking Chat</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
-    <div class="container">
+<body hx-ext="ws">
+    <div class="container" ws-connect="/ws">
         <header>
             <div class="header-left">
                 <h1>Thinking Chat</h1>
@@ -22,29 +22,12 @@
             </div>
             <div class="header-right">
                 <button id="clear-btn" class="clear-btn" title="Clear chat history">Clear</button>
-                <div class="status" id="status">Disconnected</div>
+                <div class="status disconnected" id="status">Disconnected</div>
             </div>
         </header>
         
         <div class="chat-container">
-            <div class="messages" id="messages">
-                <div class="message assistant">
-                    <div class="message-label">Assistant</div>
-                    <div class="message-content">
-                        Hi! I'm a thinking assistant powered by structured reasoning.<br><br>
-                        <strong>How it works:</strong><br>
-                        • Choose your <code>thinking effort</code> to control how much the model reasons<br>
-                        • I'll show you my thinking process (if not set to "none")<br>
-                        • The model can self-correct using chain-of-thought reasoning<br><br>
-                        <strong>Tips:</strong><br>
-                        • Use <code>Ctrl/Cmd + Enter</code> to send messages<br>
-                        • Higher effort = more thorough but slower responses<br>
-                        • Try asking complex questions with "high" effort!<br>
-                        • Your conversation history is preserved<br><br>
-                        What can I help you with today?
-                    </div>
-                </div>
-            </div>
+            <div class="messages" id="messages"></div>
         </div>
         
         <div class="input-container">
@@ -63,9 +46,11 @@
                     <option value="json_object">JSON</option>
                 </select>
             </div>
-            <form id="chat-form">
+            <form id="chat-form" ws-send>
+                <input type="hidden" name="session_id" value="{{ session_id }}">
                 <textarea 
-                    id="message-input" 
+                    id="message-input"
+                    name="message"
                     placeholder="Type your message... (Ctrl/Cmd + Enter to send)" 
                     rows="3"
                     autocomplete="off"
@@ -80,13 +65,10 @@
     </div>
     
     <script>
-        // Pass config from server to client
-        window.CONFIG = {
-            modelName: "{{ model_name }}",
-            encryptionEnabled: {{ 'true' if encryption_enabled else 'false' }}
-        };
+        const SESSION_ID = "{{ session_id }}";
     </script>
+    <script src="/static/htmx.min.js"></script>
+    <script src="/static/htmx-ext-ws.js"></script>
     <script src="/static/script.js"></script>
 </body>
 </html>
-
