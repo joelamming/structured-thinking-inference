@@ -369,6 +369,8 @@ async def process_chat_request(
         json=guided_request_1,
         timeout=None,
     )
+    if response_1.status_code != 200:
+        logger.error(f"vLLM error response: {response_1.text}")
     response_1.raise_for_status()
     resp1_json = response_1.json()
     structured_content_1 = ""
@@ -458,6 +460,8 @@ async def process_chat_request(
         json=guided_request,
         timeout=None,
     )
+    if response.status_code != 200:
+        logger.error(f"vLLM error response: {response.text}")
     response.raise_for_status()
     response_data = response.json()
     isolated_response_data = json.loads(json.dumps(response_data))
