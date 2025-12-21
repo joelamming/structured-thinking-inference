@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shitty Vibecoded Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-left">
+                <h1>Thinking Chat</h1>
+                <div class="model-info">
+                    <span class="model-name" title="{{ model_name }}">{{ model_name.split('/')[-1] }}</span>
+                    {% if encryption_enabled %}
+                    <span class="encryption-badge" title="End-to-end encrypted">🔒</span>
+                    {% else %}
+                    <span class="encryption-badge warning" title="⚠️ Encryption disabled">🔓</span>
+                    {% endif %}
+                </div>
+            </div>
+            <div class="header-right">
+                <button id="clear-btn" class="clear-btn" title="Clear chat history">Clear</button>
+                <div class="status" id="status">Disconnected</div>
+            </div>
+        </header>
+        
+        <div class="chat-container">
+            <div class="messages" id="messages">
+                <div class="message assistant">
+                    <div class="message-label">Assistant</div>
+                    <div class="message-content">
+                        Hi! I'm a thinking assistant powered by structured reasoning.<br><br>
+                        <strong>How it works:</strong><br>
+                        • Choose your <code>thinking effort</code> to control how much the model reasons<br>
+                        • I'll show you my thinking process (if not set to "none")<br>
+                        • The model can self-correct using chain-of-thought reasoning<br><br>
+                        <strong>Tips:</strong><br>
+                        • Use <code>Ctrl/Cmd + Enter</code> to send messages<br>
+                        • Higher effort = more thorough but slower responses<br>
+                        • Try asking complex questions with "high" effort!<br>
+                        • Your conversation history is preserved<br><br>
+                        What can I help you with today?
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="input-container">
+            <div class="controls">
+                <label for="effort">Thinking effort:</label>
+                <select id="effort" name="effort">
+                    <option value="none">None (instant)</option>
+                    <option value="low">Low (500 tokens)</option>
+                    <option value="medium" selected>Medium (2000 tokens)</option>
+                    <option value="high">High (16000 tokens)</option>
+                </select>
+                <div class="spacer"></div>
+                <label for="format">Response format:</label>
+                <select id="format" name="format">
+                    <option value="text" selected>Text</option>
+                    <option value="json_object">JSON</option>
+                </select>
+            </div>
+            <form id="chat-form">
+                <textarea 
+                    id="message-input" 
+                    placeholder="Type your message... (Ctrl/Cmd + Enter to send)" 
+                    rows="3"
+                    autocomplete="off"
+                    maxlength="10000"
+                ></textarea>
+                <button type="submit" id="send-btn">
+                    <span class="btn-text">Send</span>
+                    <span class="btn-spinner" style="display: none;">⏳</span>
+                </button>
+            </form>
+        </div>
+    </div>
+    
+    <script>
+        // Pass config from server to client
+        window.CONFIG = {
+            modelName: "{{ model_name }}",
+            encryptionEnabled: {{ 'true' if encryption_enabled else 'false' }}
+        };
+    </script>
+    <script src="/static/script.js"></script>
+</body>
+</html>
+

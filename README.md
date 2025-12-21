@@ -21,10 +21,22 @@ Public-facing implementation
 | `medium` | 2000 |
 | `high` | 16000 |
 
-## Services (single container)
+## Architecture
 
-- `vllm` server running inside the same container (port `8000`).
-- `orchestrator` FastAPI app (port `8005`) with an in-memory queue/cache (lost on restart).
+This repo contains two components:
+
+### Orchestrator (runs somewhere with a GPU)
+- `vllm` server running inside the same container (port `8000`)
+- `orchestrator` FastAPI app (port `8005`) with an in-memory queue/cache (lost on restart)
+- Handles WebSocket connections and manages thinking inference
+- See `orchestrator/` directory
+
+### Frontend (runs locally)
+- Pure HTML/CSS/HTMX chat interface
+- Connects to orchestrator via WebSocket
+- Fernet encryption for message security
+- No frameworks, no build tools, just FastAPI serving HTML
+- See `frontend/` directory and `frontend/README.md`
 
 ## Required envs
 
@@ -106,3 +118,19 @@ Connections are closed after 45 seconds of inactivity (no messages received).
 All message content is encrypted with Fernet symmetric encryption. Clients must:
 1. Encrypt `messages[].content` with the shared `ORCH_ENCRYPTION_KEY` before sending
 2. Decrypt `result.choices[].message.content` and `.thinking` from responses
+
+## Frontend quickstart
+
+```bash
+cd frontend
+pip install -r requirements.txt
+
+# Set your encryption key (must match orchestrator)
+export ORCH_ENCRYPTION_KEY="fernet-key"
+export ORCHESTRATOR_WS_URL="ws://your-orchestrator:8005/ws/completions"
+
+./run.sh
+# Open http://localhost:8080
+```
+
+See `frontend/QUICKSTART.md` for details.

@@ -3,3 +3,4 @@ test.py
 problems.md
 mypy.ini
 .env
+*.pyc
