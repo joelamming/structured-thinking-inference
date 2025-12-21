@@ -281,10 +281,10 @@ async def process_chat_request(
 
     decrypted_messages: List[Dict[str, str]] = []
     for message in request.messages:
-        encrypted_content_b64 = message.get("content", "")
-        if isinstance(encrypted_content_b64, str):
-            encrypted_content_bytes = base64.b64decode(encrypted_content_b64)
-            decrypted_content = request_fernet.decrypt(encrypted_content_bytes).decode(
+        encrypted_content_token = message.get("content", "")
+        if isinstance(encrypted_content_token, str):
+            # Fernet token is already base64-encoded, just needs to be bytes
+            decrypted_content = request_fernet.decrypt(encrypted_content_token.encode()).decode(
                 "utf-8"
             )
             decrypted_messages.append(
@@ -399,13 +399,11 @@ async def process_chat_request(
             message = isolated_response_data["choices"][0]["message"]
             content_bytes = message["content"].encode("utf-8")
             encrypted_content = request_fernet.encrypt(content_bytes)
-            message["content"] = base64.b64encode(encrypted_content).decode("ascii")
+            message["content"] = encrypted_content.decode("utf-8")  # Fernet token is already base64
             if "thinking" in message and message["thinking"]:
                 thinking_bytes = message["thinking"].encode("utf-8")
                 encrypted_thinking = request_fernet.encrypt(thinking_bytes)
-                message["thinking"] = base64.b64encode(encrypted_thinking).decode(
-                    "ascii"
-                )
+                message["thinking"] = encrypted_thinking.decode("utf-8")  # Fernet token is already base64
         return isolated_response_data
 
     correction_thinking_body = (
@@ -482,11 +480,11 @@ async def process_chat_request(
         message = isolated_response_data["choices"][0]["message"]
         content_bytes = message["content"].encode("utf-8")
         encrypted_content = request_fernet.encrypt(content_bytes)
-        message["content"] = base64.b64encode(encrypted_content).decode("ascii")
+        message["content"] = encrypted_content.decode("ascii")  # Fernet token is already base64
         if "thinking" in message and message["thinking"]:
             thinking_bytes = message["thinking"].encode("utf-8")
             encrypted_thinking = request_fernet.encrypt(thinking_bytes)
-            message["thinking"] = base64.b64encode(encrypted_thinking).decode("ascii")
+            message["thinking"] = encrypted_thinking.decode("ascii")  # Fernet token is already base64
 
     return isolated_response_data
 

@@ -1,6 +1,8 @@
 ## Build and deploy (orchestrator + vLLM) without local Docker on target
 
-This guide shows how to build the orchestrator image on a build box (e.g. EC2), push it to a registry run it on a platform like RunPod or ECS. This avoids Docker-in-Docker quirks on some GPU-as-a-Service vendors.
+This guide shows how to build the orchestrator image on a build box (e.g. EC2), push it to a registry and run it on platforms like ECS. This avoids Docker-in-Docker quirks on some GPU-as-a-Service vendors.
+
+Note that pulling a 9GB container takes ages. It's often easier to just spin up via the Jupyter Notebook terminal if you're in RunPod. See [RUNPOD_DEPLOY.md](RUNPOD_DEPLOY.md) for details. The below is best if you plan to cache your containers nearby so they pull fast.
 
 ### Prerequisites
 - A Linux/x86_64 build machine with Docker/Buildx (Ubuntu/AL2 is fine; build with `--platform=linux/amd64`).
@@ -61,12 +63,15 @@ export REG=<acct>.dkr.ecr.<region>.amazonaws.com/structured-thinking-inference
 ```bash
 docker buildx create --use --name builder || docker buildx use builder
 TAG=$(git rev-parse --short HEAD)
+
 docker buildx build --platform=linux/amd64 \
   -t $REG:latest \
   -t $REG:$TAG \
   -f orchestrator/Dockerfile \
   --push .
 ```
+
+> **Note:** First build pulls [~8GB](https://hub.docker.com/layers/vllm/vllm-openai/v0.12.0/images/sha256-f2309d913a07da49ea20b2a694703f4cfcb5ad8e7437ec0f26145479ac01e002) vLLM base image (CUDA + PyTorch + vLLM).
 
 ### 4. Runtime images
 - Single container image: the image we just built (contains vLLM server + orchestrator under `supervisord`).
@@ -95,6 +100,7 @@ TENSOR_PARALLEL=1                     # adjust for GPU count
 - Expose port `8005` (HTTP/WebSocket).
 - Provide env vars above; state is in-memory and resets on container restart.
 - GPU: enable the CaaS vendor GPU toggle so `vllm serve` can see the device.
+- **Recommended:** Mount a persistent volume to `/root/.cache/huggingface` to cache model weights (gigabytes or terabytes depending on your model) across restarts.
 
 ### 7. Deploy on ECS (task definition outline)
 - Single container in the task:
@@ -103,6 +109,24 @@ TENSOR_PARALLEL=1                     # adjust for GPU count
   - Env vars above (MODEL_NAME/HF_TOKEN/TENSOR_PARALLEL for vLLM; ORCH_* for FastAPI)
 
 ### 8. Testing
+
+#### Local Testing with Docker
+```bash
+# Create a persistent volume for model cache
+docker volume create hf-cache
+
+# Run the container
+docker run --rm -it --gpus all \
+  -p 8005:8005 -p 8000:8000 \
+  -v hf-cache:/root/.cache/huggingface \
+  -e MODEL_NAME=Qwen/Qwen3-VL-4B-Thinking \
+  -e HF_TOKEN=your_token \
+  -e ORCH_API_KEY=test-key \
+  -e ORCH_ENCRYPTION_KEY=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())") \
+  $REG:latest
+```
+
+#### Health Checks
 - Orchestrator health: `GET http://<orchestrator-host>:8005/health`
 - Dashboard: `http://<orchestrator-host>:8005/dashboard`
 - OpenAPI docs: `http://<orchestrator-host>:8005/docs`
