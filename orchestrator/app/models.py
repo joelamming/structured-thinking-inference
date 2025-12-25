@@ -57,3 +57,28 @@ class CompletionWebSocketRequest(BaseModel):
     request: ChatRequest
     client_request_id: Optional[str] = None
     timeout_seconds: Optional[int] = None
+
+
+class OCRRequest(BaseModel):
+    """
+    OCR request for DeepSeek-OCR model.
+    Messages should follow OpenAI chat format with image_url content.
+    """
+    messages: List[Dict[str, Any]]
+    model: str = Field(default="deepseek-ai/DeepSeek-OCR", min_length=1)
+    max_tokens: int = 4000
+    temperature: float = 0.0
+    extra_body: Optional[Dict[str, Any]] = None
+
+    @field_validator("model")
+    @classmethod
+    def ensure_model(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Model name must be provided")
+        return v
+
+
+class OCRWebSocketRequest(BaseModel):
+    request: OCRRequest
+    client_request_id: Optional[str] = None
+    timeout_seconds: Optional[int] = None

@@ -32,6 +32,8 @@ from orchestrator.app.models import (
     EmbeddingRequest,
     ChatRequest,
     CompletionWebSocketRequest,
+    OCRRequest,
+    OCRWebSocketRequest,
 )
 
 
@@ -116,13 +118,38 @@ async def worker_loop():
             await job_store.increment_active()
             active_incremented = True
             await job_store.update_status(job_id, "running", started_ts=time.time())
-            chat_request = ChatRequest.model_validate(request_payload)
-            result_payload = await process_chat_request(
-                chat_request,
-                job_id=job_id,
-                client_request_id=client_request_id,
-                completions_url=completions_url,
-            )
+            
+            # Determine job type by checking payload structure
+            # OCR requests have 'messages' with image_url content types
+            # Chat requests have 'messages' with simpler structure and 'thinking_effort'
+            is_ocr_job = False
+            if "thinking_effort" not in request_payload:
+                # Likely an OCR job - validate with OCRRequest model
+                try:
+                    ocr_request = OCRRequest.model_validate(request_payload)
+                    is_ocr_job = True
+                except Exception:
+                    # Fall back to ChatRequest
+                    pass
+            
+            if is_ocr_job:
+                # Process as OCR request
+                ocr_request = OCRRequest.model_validate(request_payload)
+                result_payload = await process_ocr_request(
+                    ocr_request,
+                    job_id=job_id,
+                    client_request_id=client_request_id,
+                )
+            else:
+                # Process as Chat request (existing logic)
+                chat_request = ChatRequest.model_validate(request_payload)
+                result_payload = await process_chat_request(
+                    chat_request,
+                    job_id=job_id,
+                    client_request_id=client_request_id,
+                    completions_url=completions_url,
+                )
+            
             await job_store.update_status(job_id, "completed", finished_ts=time.time())
             await job_store.publish_result(
                 job_id,
@@ -133,6 +160,7 @@ async def worker_loop():
                     "request_id": job_id,
                     "client_request_id": client_request_id,
                     "status": "completed",
+                    "job_type": "ocr" if is_ocr_job else "chat",
                     "response_metadata": result_payload.get("usage"),
                     "timestamp": time.time(),
                 }
@@ -493,6 +521,115 @@ async def process_chat_request(
     return isolated_response_data
 
 
+async def process_ocr_request(
+    request: OCRRequest,
+    job_id: str,
+    client_request_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Process an OCR request by decrypting messages, calling vLLM DeepSeek-OCR,
+    and encrypting the response.
+    
+    Unlike process_chat_request, this is a simple pass-through:
+    - No multi-step thinking pipeline
+    - Direct call to vLLM with image data
+    - Returns encrypted markdown/HTML output
+    """
+    assert http_client is not None
+    request_fernet = fernet
+    logger_prefix = f"[OCR Job {job_id}"
+    if client_request_id:
+        logger_prefix += f", Client {client_request_id[:8]}"
+    logger_prefix += "] "
+
+    # Decrypt message contents (including base64 image data)
+    decrypted_messages: List[Dict[str, Any]] = []
+    for message in request.messages:
+        role = message.get("role", "user")
+        content = message.get("content", [])
+        
+        # Handle both string content and array content (for images)
+        if isinstance(content, str):
+            # Simple text content - decrypt it
+            decrypted_content = request_fernet.decrypt(content.encode()).decode("utf-8")
+            decrypted_messages.append({"role": role, "content": decrypted_content})
+        elif isinstance(content, list):
+            # Array content with potentially image_url and text parts
+            decrypted_content_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                    if part_type == "text":
+                        # Decrypt text content
+                        encrypted_text = part.get("text", "")
+                        decrypted_text = request_fernet.decrypt(encrypted_text.encode()).decode("utf-8")
+                        decrypted_content_parts.append({"type": "text", "text": decrypted_text})
+                    elif part_type == "image_url":
+                        # Decrypt the image URL (which contains base64 data)
+                        image_url_obj = part.get("image_url", {})
+                        encrypted_url = image_url_obj.get("url", "")
+                        decrypted_url = request_fernet.decrypt(encrypted_url.encode()).decode("utf-8")
+                        decrypted_content_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": decrypted_url}
+                        })
+                    else:
+                        # Unknown type, pass through
+                        decrypted_content_parts.append(part)
+            decrypted_messages.append({"role": role, "content": decrypted_content_parts})
+        else:
+            # Unknown format, pass through
+            decrypted_messages.append({"role": role, "content": content})
+
+    # Prepare vLLM request (OpenAI chat/completions format)
+    ocr_url = settings.ocr_server_url or settings.llm_server_url.replace("/completions")
+    
+    vllm_request: Dict[str, Any] = {
+        "model": request.model,
+        "messages": decrypted_messages,
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature,
+    }
+    
+    # Add extra_body if provided (for vllm_xargs like ngram_size, etc.)
+    if request.extra_body:
+        for key, value in request.extra_body.items():
+            vllm_request[key] = value
+
+    logger.debug(f"{logger_prefix}Sending OCR request to {ocr_url}")
+    
+    # Call vLLM
+    response = await http_client.post(
+        ocr_url,
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-ID": job_id,
+            "X-Client-Request-ID": client_request_id or "none",
+        },
+        json=vllm_request,
+        timeout=None,
+    )
+    
+    if response.status_code != 200:
+        logger.error(f"{logger_prefix}vLLM error response: {response.text}")
+    response.raise_for_status()
+    
+    response_data = response.json()
+    
+    # Encrypt the response content
+    if response_data.get("choices"):
+        for choice in response_data["choices"]:
+            message = choice.get("message", {})
+            content = message.get("content", "")
+            
+            if content:
+                content_bytes = content.encode("utf-8")
+                encrypted_content = request_fernet.encrypt(content_bytes)
+                message["content"] = encrypted_content.decode("ascii")
+    
+    return response_data
+
+
 @app.websocket("/ws/completions")
 async def websocket_completions(websocket: WebSocket):
     """
@@ -713,6 +850,250 @@ async def websocket_completions(websocket: WebSocket):
         pass
     except Exception as exc:
         logger.exception("WebSocket handler error: %s", exc)
+    finally:
+        # Signal shutdown and clean up
+        shutdown_event.set()
+        connection_alive = False
+
+        # Cancel background tasks
+        receiver.cancel()
+        keepalive.cancel()
+        for task in active_waiters.values():
+            task.cancel()
+
+        with suppress(asyncio.CancelledError):
+            await receiver
+        with suppress(asyncio.CancelledError):
+            await keepalive
+        for task in active_waiters.values():
+            with suppress(asyncio.CancelledError):
+                await task
+
+        # Cancel any outstanding jobs
+        for job_id in list(pending_jobs.keys()):
+            await job_store.cancel_job(job_id)
+
+        await job_store.decrement_ws_connections()
+
+
+@app.websocket("/ws/ocr")
+async def websocket_ocr(websocket: WebSocket):
+    """
+    WebSocket endpoint for OCR requests using DeepSeek-OCR model.
+    
+    Handles image-to-markdown/HTML conversion requests with:
+    - Symmetric encryption for image data and responses
+    - Job queue for managing concurrent requests
+    - Keepalive and cancellation support
+    
+    Uses the same architecture as /ws/completions but simpler processing
+    (no multi-step thinking pipeline).
+    """
+    api_key = websocket.headers.get("X-API-Key")
+    if api_key != settings.api_key:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    await websocket.accept()
+    assert job_store is not None
+    await job_store.increment_ws_connections()
+
+    # Shared state for concurrent tasks
+    pending_jobs: dict[str, float] = {}  # job_id -> deadline timestamp
+    incoming_requests: asyncio.Queue[dict] = asyncio.Queue()
+    connection_alive = True
+    last_client_activity = time.time()
+    shutdown_event = asyncio.Event()
+
+    # Keepalive configuration
+    ping_interval_seconds = 15
+    activity_timeout_seconds = ping_interval_seconds * 3  # 45s of inactivity = dead
+
+    async def receiver_task():
+        """
+        Receive all messages from the client and route them.
+        Runs until connection closes or shutdown is signalled.
+        """
+        nonlocal connection_alive, last_client_activity
+        try:
+            while connection_alive and not shutdown_event.is_set():
+                try:
+                    message = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=1.0,  # Short timeout to check shutdown_event
+                    )
+                    last_client_activity = time.time()
+                    try:
+                        payload = json.loads(message)
+                        msg_type = payload.get("type")
+
+                        if msg_type == "pong":
+                            # Pong received - activity already updated above
+                            continue
+                        elif msg_type == "cancel":
+                            # Client wants to cancel a job
+                            cancel_job_id = payload.get("request_id")
+                            if cancel_job_id and cancel_job_id in pending_jobs:
+                                await job_store.cancel_job(cancel_job_id)
+                                pending_jobs.pop(cancel_job_id, None)
+                            continue
+                        else:
+                            # Assume it's an OCR request
+                            await incoming_requests.put(payload)
+                    except json.JSONDecodeError as exc:
+                        logger.warning("Invalid JSON from client: %s", exc)
+                        try:
+                            await websocket.send_json(
+                                {"type": "error", "error": f"Invalid JSON: {exc}"}
+                            )
+                        except Exception:
+                            pass
+                except asyncio.TimeoutError:
+                    # No message received, just loop to check shutdown_event
+                    continue
+        except WebSocketDisconnect:
+            logger.debug("WebSocket disconnected in receiver")
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Receiver task error: %s", exc)
+        finally:
+            connection_alive = False
+
+    async def keepalive_task():
+        """
+        Send periodic pings and monitor client activity.
+        Closes connection if client appears dead.
+        """
+        nonlocal connection_alive
+        try:
+            while connection_alive and not shutdown_event.is_set():
+                await asyncio.sleep(ping_interval_seconds)
+                if shutdown_event.is_set() or not connection_alive:
+                    break
+
+                # Check if we've had any activity recently
+                time_since_activity = time.time() - last_client_activity
+                if time_since_activity > activity_timeout_seconds:
+                    logger.warning(
+                        "No client activity for %.1fs, closing connection",
+                        time_since_activity,
+                    )
+                    connection_alive = False
+                    break
+
+                # Send application-level ping
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception as exc:
+                    logger.debug("Failed to send ping: %s", exc)
+                    connection_alive = False
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Keepalive task error: %s", exc)
+            connection_alive = False
+
+    async def result_waiter_task(job_id: str, timeout_seconds: int):
+        """Wait for a job result and return it, or None if timed out/cancelled."""
+        try:
+            result = await job_store.wait_for_result(job_id, timeout_seconds)
+            return result
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            return None
+
+    # Start background tasks
+    receiver = asyncio.create_task(receiver_task())
+    keepalive = asyncio.create_task(keepalive_task())
+    active_waiters: dict[str, asyncio.Task] = {}  # job_id -> waiter task
+
+    try:
+        while connection_alive:
+            # Process incoming requests (non-blocking check)
+            try:
+                payload = incoming_requests.get_nowait()
+                try:
+                    ws_request = OCRWebSocketRequest.model_validate(payload)
+                    job_id = await job_store.enqueue_job(
+                        ws_request.request.model_dump(),
+                        ws_request.client_request_id,
+                    )
+                    timeout_seconds = int(
+                        ws_request.timeout_seconds or settings.job_timeout_seconds
+                    )
+                    pending_jobs[job_id] = time.time() + timeout_seconds
+                    # Start a waiter task for this job
+                    active_waiters[job_id] = asyncio.create_task(
+                        result_waiter_task(job_id, timeout_seconds)
+                    )
+                except Exception as exc:
+                    logger.warning("Invalid OCR request payload: %s", exc)
+                    try:
+                        await websocket.send_json(
+                            {"type": "error", "error": f"Invalid payload: {exc}"}
+                        )
+                    except Exception:
+                        pass
+            except asyncio.QueueEmpty:
+                pass
+
+            # Check for completed job waiters
+            completed_waiters = [
+                jid for jid, task in active_waiters.items() if task.done()
+            ]
+            for job_id in completed_waiters:
+                task = active_waiters.pop(job_id)
+                pending_jobs.pop(job_id, None)
+                try:
+                    result = task.result()
+                    if result is not None:
+                        await websocket.send_json(result)
+                    else:
+                        # Timed out
+                        await job_store.cancel_job(job_id)
+                        await websocket.send_json(
+                            {
+                                "type": "timeout",
+                                "request_id": job_id,
+                                "error": "Request timed out",
+                            }
+                        )
+                except asyncio.CancelledError:
+                    await job_store.cancel_job(job_id)
+                except Exception as exc:
+                    logger.warning("Error processing OCR job result: %s", exc)
+
+            # Check for jobs that have exceeded their deadline
+            now = time.time()
+            expired_jobs = [
+                jid for jid, deadline in pending_jobs.items() if now > deadline
+            ]
+            for job_id in expired_jobs:
+                pending_jobs.pop(job_id, None)
+                if job_id in active_waiters:
+                    active_waiters[job_id].cancel()
+                    active_waiters.pop(job_id, None)
+                await job_store.cancel_job(job_id)
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "timeout",
+                            "request_id": job_id,
+                            "error": "Request timed out",
+                        }
+                    )
+                except Exception:
+                    pass
+
+            # Brief sleep to prevent busy-loop
+            await asyncio.sleep(0.1)
+
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    except Exception as exc:
+        logger.exception("OCR WebSocket handler error: %s", exc)
     finally:
         # Signal shutdown and clean up
         shutdown_event.set()

@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     llm_server_url: str = "http://127.0.0.1:8000/v1/completions"
     llm_metrics_url: str = "http://127.0.0.1:8000/metrics"
     embedding_server_url: str = "http://127.0.0.1:8000/v1/embeddings"
+    ocr_server_url: Optional[str] = None  # Defaults to llm_server_url for chat/completions
     log_file_path: str = "llm_request_logs.jsonl"
     enable_request_logs: bool = False
     metrics_interval_seconds: int = 5
