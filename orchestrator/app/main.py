@@ -118,7 +118,7 @@ async def worker_loop():
             await job_store.increment_active()
             active_incremented = True
             await job_store.update_status(job_id, "running", started_ts=time.time())
-            
+
             # Determine job type by checking payload structure
             # OCR requests have 'messages' with image_url content types
             # Chat requests have 'messages' with simpler structure and 'thinking_effort'
@@ -131,7 +131,7 @@ async def worker_loop():
                 except Exception:
                     # Fall back to ChatRequest
                     pass
-            
+
             if is_ocr_job:
                 # Process as OCR request
                 ocr_request = OCRRequest.model_validate(request_payload)
@@ -149,7 +149,7 @@ async def worker_loop():
                     client_request_id=client_request_id,
                     completions_url=completions_url,
                 )
-            
+
             await job_store.update_status(job_id, "completed", finished_ts=time.time())
             await job_store.publish_result(
                 job_id,
@@ -312,9 +312,9 @@ async def process_chat_request(
         encrypted_content_token = message.get("content", "")
         if isinstance(encrypted_content_token, str):
             # Fernet token is already base64-encoded, just needs to be bytes
-            decrypted_content = request_fernet.decrypt(encrypted_content_token.encode()).decode(
-                "utf-8"
-            )
+            decrypted_content = request_fernet.decrypt(
+                encrypted_content_token.encode()
+            ).decode("utf-8")
             decrypted_messages.append(
                 {"role": message.get("role", "user"), "content": decrypted_content}
             )
@@ -429,11 +429,15 @@ async def process_chat_request(
             message = isolated_response_data["choices"][0]["message"]
             content_bytes = message["content"].encode("utf-8")
             encrypted_content = request_fernet.encrypt(content_bytes)
-            message["content"] = encrypted_content.decode("utf-8")  # Fernet token is already base64
+            message["content"] = encrypted_content.decode(
+                "utf-8"
+            )  # Fernet token is already base64
             if "thinking" in message and message["thinking"]:
                 thinking_bytes = message["thinking"].encode("utf-8")
                 encrypted_thinking = request_fernet.encrypt(thinking_bytes)
-                message["thinking"] = encrypted_thinking.decode("utf-8")  # Fernet token is already base64
+                message["thinking"] = encrypted_thinking.decode(
+                    "utf-8"
+                )  # Fernet token is already base64
         return isolated_response_data
 
     correction_thinking_body = (
@@ -512,11 +516,15 @@ async def process_chat_request(
         message = isolated_response_data["choices"][0]["message"]
         content_bytes = message["content"].encode("utf-8")
         encrypted_content = request_fernet.encrypt(content_bytes)
-        message["content"] = encrypted_content.decode("ascii")  # Fernet token is already base64
+        message["content"] = encrypted_content.decode(
+            "ascii"
+        )  # Fernet token is already base64
         if "thinking" in message and message["thinking"]:
             thinking_bytes = message["thinking"].encode("utf-8")
             encrypted_thinking = request_fernet.encrypt(thinking_bytes)
-            message["thinking"] = encrypted_thinking.decode("ascii")  # Fernet token is already base64
+            message["thinking"] = encrypted_thinking.decode(
+                "ascii"
+            )  # Fernet token is already base64
 
     return isolated_response_data
 
@@ -529,7 +537,7 @@ async def process_ocr_request(
     """
     Process an OCR request by decrypting messages, calling vLLM DeepSeek-OCR,
     and encrypting the response.
-    
+
     Unlike process_chat_request, this is a simple pass-through:
     - No multi-step thinking pipeline
     - Direct call to vLLM with image data
@@ -547,7 +555,7 @@ async def process_ocr_request(
     for message in request.messages:
         role = message.get("role", "user")
         content = message.get("content", [])
-        
+
         # Handle both string content and array content (for images)
         if isinstance(content, str):
             # Simple text content - decrypt it
@@ -562,42 +570,53 @@ async def process_ocr_request(
                     if part_type == "text":
                         # Decrypt text content
                         encrypted_text = part.get("text", "")
-                        decrypted_text = request_fernet.decrypt(encrypted_text.encode()).decode("utf-8")
-                        decrypted_content_parts.append({"type": "text", "text": decrypted_text})
+                        decrypted_text = request_fernet.decrypt(
+                            encrypted_text.encode()
+                        ).decode("utf-8")
+                        decrypted_content_parts.append(
+                            {"type": "text", "text": decrypted_text}
+                        )
                     elif part_type == "image_url":
                         # Decrypt the image URL (which contains base64 data)
                         image_url_obj = part.get("image_url", {})
                         encrypted_url = image_url_obj.get("url", "")
-                        decrypted_url = request_fernet.decrypt(encrypted_url.encode()).decode("utf-8")
-                        decrypted_content_parts.append({
+                        decrypted_url = request_fernet.decrypt(
+                            encrypted_url.encode()
+                        ).decode("utf-8")
+                        image_url_part: Dict[str, Any] = {
                             "type": "image_url",
-                            "image_url": {"url": decrypted_url}
-                        })
+                            "image_url": {"url": decrypted_url},
+                        }
+                        decrypted_content_parts.append(image_url_part)
                     else:
                         # Unknown type, pass through
                         decrypted_content_parts.append(part)
-            decrypted_messages.append({"role": role, "content": decrypted_content_parts})
+            decrypted_messages.append(
+                {"role": role, "content": decrypted_content_parts}
+            )
         else:
             # Unknown format, pass through
             decrypted_messages.append({"role": role, "content": content})
 
     # Prepare vLLM request (OpenAI chat/completions format)
-    ocr_url = settings.ocr_server_url or settings.llm_server_url.replace("/completions")
-    
+    ocr_url = settings.ocr_server_url or settings.llm_server_url.replace(
+        "/v1/completions", "/v1/chat/completions"
+    )
+
     vllm_request: Dict[str, Any] = {
         "model": request.model,
         "messages": decrypted_messages,
         "max_tokens": request.max_tokens,
         "temperature": request.temperature,
     }
-    
+
     # Add extra_body if provided (for vllm_xargs like ngram_size, etc.)
     if request.extra_body:
         for key, value in request.extra_body.items():
             vllm_request[key] = value
 
     logger.debug(f"{logger_prefix}Sending OCR request to {ocr_url}")
-    
+
     # Call vLLM
     response = await http_client.post(
         ocr_url,
@@ -609,24 +628,24 @@ async def process_ocr_request(
         json=vllm_request,
         timeout=None,
     )
-    
+
     if response.status_code != 200:
         logger.error(f"{logger_prefix}vLLM error response: {response.text}")
     response.raise_for_status()
-    
+
     response_data = response.json()
-    
+
     # Encrypt the response content
     if response_data.get("choices"):
         for choice in response_data["choices"]:
             message = choice.get("message", {})
             content = message.get("content", "")
-            
+
             if content:
                 content_bytes = content.encode("utf-8")
                 encrypted_content = request_fernet.encrypt(content_bytes)
                 message["content"] = encrypted_content.decode("ascii")
-    
+
     return response_data
 
 
@@ -880,12 +899,12 @@ async def websocket_completions(websocket: WebSocket):
 async def websocket_ocr(websocket: WebSocket):
     """
     WebSocket endpoint for OCR requests using DeepSeek-OCR model.
-    
+
     Handles image-to-markdown/HTML conversion requests with:
     - Symmetric encryption for image data and responses
     - Job queue for managing concurrent requests
     - Keepalive and cancellation support
-    
+
     Uses the same architecture as /ws/completions but simpler processing
     (no multi-step thinking pipeline).
     """

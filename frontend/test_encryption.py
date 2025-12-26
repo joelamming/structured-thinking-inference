@@ -4,6 +4,7 @@ Test script to verify Fernet encryption/decryption
 """
 
 import os
+
 from cryptography.fernet import Fernet
 
 

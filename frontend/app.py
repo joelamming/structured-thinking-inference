@@ -7,20 +7,21 @@ Architecture:
 - Frontend <-> Orchestrator (WebSocket - Fernet encrypted)
 """
 
-import os
-import json
 import asyncio
+import json
+import os
 import re
 import time
-from typing import Optional, Dict, List, Any
+from typing import Any
 from uuid import uuid4
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form
+
+import websockets  # type: ignore[import-untyped]
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from cryptography.fernet import Fernet
-import websockets
-from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
@@ -48,7 +49,7 @@ elif not ORCHESTRATOR_API_KEY:
     print("⚠️  WARNING: ORCH_API_KEY not set - orchestrator will reject connections!")
 
 # Initialize Fernet cipher for server-to-server encryption
-fernet: Optional[Fernet] = None
+fernet: Fernet | None = None
 if ENCRYPTION_KEY:
     try:
         fernet = Fernet(ENCRYPTION_KEY.encode())
@@ -60,7 +61,7 @@ else:
     print("⚠️  ORCH_ENCRYPTION_KEY not set - encryption disabled!")
 
 # In-memory session store: session_id -> conversation history
-sessions: Dict[str, List[Dict]] = {}
+sessions: dict[str, list[dict]] = {}
 
 
 def format_content(text: str) -> str:
@@ -69,9 +70,7 @@ def format_content(text: str) -> str:
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     # Convert ```code blocks``` to <pre><code>
-    text = re.sub(
-        r"```(\w+)?\n(.*?)```", r"<pre><code>\2</code></pre>", text, flags=re.DOTALL
-    )
+    text = re.sub(r"```(\w+)?\n(.*?)```", r"<pre><code>\2</code></pre>", text, flags=re.DOTALL)
 
     # Convert `inline code` to <code>
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
@@ -85,7 +84,7 @@ def format_content(text: str) -> str:
     return text
 
 
-def generate_mock_response(user_message: str, effort: str) -> Dict[str, Any]:
+def generate_mock_response(user_message: str, effort: str) -> dict[str, Any]:
     """
     Generate a mock orchestrator response without hitting the real backend.
     Matches the exact structure from orchestrator/app/main.py line 129.
@@ -93,9 +92,7 @@ def generate_mock_response(user_message: str, effort: str) -> Dict[str, Any]:
     # Mock thinking based on effort
     thinking_samples = {
         "none": "",
-        "low": 'Let me think about this quickly...\n\nThe user asked: "'
-        + user_message[:50]
-        + '"',
+        "low": 'Let me think about this quickly...\n\nThe user asked: "' + user_message[:50] + '"',
         "medium": "Alright, let me carefully consider this question.\n\n"
         + 'The user is asking about: "'
         + user_message[:50]
@@ -133,9 +130,7 @@ def generate_mock_response(user_message: str, effort: str) -> Dict[str, Any]:
     if fernet:
         encrypted_content = fernet.encrypt(content.encode()).decode("utf-8")
         encrypted_thinking = (
-            fernet.encrypt(thinking_text.encode()).decode("utf-8")
-            if thinking_text
-            else ""
+            fernet.encrypt(thinking_text.encode()).decode("utf-8") if thinking_text else ""
         )
     else:
         encrypted_content = content
@@ -170,7 +165,7 @@ async def websocket_handler(websocket: WebSocket):
     - Sends HTML fragments back to browser
     """
     await websocket.accept()
-    session_id: Optional[str] = None
+    session_id: str | None = None
     orchestrator_ws = None
     ping_task = None
 
@@ -191,7 +186,7 @@ async def websocket_handler(websocket: WebSocket):
             if ORCHESTRATOR_API_KEY:
                 headers["X-API-Key"] = ORCHESTRATOR_API_KEY
 
-            orchestrator_ws = await websockets.connect(
+            orchestrator_ws = await websockets.connect(  # type: ignore[attr-defined]
                 ORCHESTRATOR_WS_URL, additional_headers=headers
             )
 
@@ -242,9 +237,7 @@ async def websocket_handler(websocket: WebSocket):
                 # Mock mode: Generate response without hitting backend
                 if MOCK_MODE:
                     # Simulate processing delay
-                    delay = {"none": 0.5, "low": 1.0, "medium": 2.0, "high": 3.0}.get(
-                        effort, 2.0
-                    )
+                    delay = {"none": 0.5, "low": 1.0, "medium": 2.0, "high": 3.0}.get(effort, 2.0)
                     await asyncio.sleep(delay)
 
                     response_data = generate_mock_response(user_message, effort)
@@ -324,15 +317,11 @@ async def websocket_handler(websocket: WebSocket):
                             pass
 
                     # Add to session history
-                    sessions[session_id].append(
-                        {"role": "assistant", "content": content}
-                    )
+                    sessions[session_id].append({"role": "assistant", "content": content})
 
                     # Render assistant message HTML and status update
                     thinking_id = f"thinking-{int(time.time() * 1000)}"
-                    assistant_html = templates.get_template(
-                        "message_assistant.html"
-                    ).render(
+                    assistant_html = templates.get_template("message_assistant.html").render(
                         content=format_content(content),
                         thinking=thinking,
                         thinking_id=thinking_id,

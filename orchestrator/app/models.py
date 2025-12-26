@@ -64,6 +64,7 @@ class OCRRequest(BaseModel):
     OCR request for DeepSeek-OCR model.
     Messages should follow OpenAI chat format with image_url content.
     """
+
     messages: List[Dict[str, Any]]
     model: str = Field(default="deepseek-ai/DeepSeek-OCR", min_length=1)
     max_tokens: int = 4000
