@@ -1,9 +1,12 @@
 import asyncio
 import json
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Literal
 from uuid import uuid4
 from orchestrator.app.config import Settings
+
+
+JobType = Literal["chat", "ocr"]
 
 
 class InMemoryJobStore:
@@ -11,9 +14,9 @@ class InMemoryJobStore:
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.queue: asyncio.Queue[Tuple[str, Dict[str, Any], Optional[str]]] = (
-            asyncio.Queue()
-        )
+        self.queue: asyncio.Queue[
+            Tuple[str, JobType, Dict[str, Any], Optional[str]]
+        ] = asyncio.Queue()
         self.results: Dict[str, Dict[str, Any]] = {}
         self.status: Dict[str, Dict[str, Any]] = {}
         self.result_waiters: Dict[str, asyncio.Future] = {}
@@ -24,24 +27,29 @@ class InMemoryJobStore:
 
     async def enqueue_job(
         self,
+        job_type: JobType,
         request_payload: Dict[str, Any],
         client_request_id: Optional[str],
+        timeout_seconds: Optional[int] = None,
     ) -> str:
         job_id = str(uuid4())
         created_ts = time.time()
+        effective_timeout = int(timeout_seconds or self.settings.job_timeout_seconds)
         async with self.lock:
             self.status[job_id] = {
                 "status": "pending",
+                "job_type": job_type,
                 "request": request_payload,
                 "client_request_id": client_request_id or "",
                 "created_ts": created_ts,
+                "timeout_seconds": effective_timeout,
             }
-        await self.queue.put((job_id, request_payload, client_request_id))
+        await self.queue.put((job_id, job_type, request_payload, client_request_id))
         return job_id
 
     async def get_next_job(
         self, timeout_seconds: float = 1.0
-    ) -> Optional[Tuple[str, Dict[str, Any], Optional[str]]]:
+    ) -> Optional[Tuple[str, JobType, Dict[str, Any], Optional[str]]]:
         try:
             while True:
                 item = await asyncio.wait_for(self.queue.get(), timeout=timeout_seconds)
@@ -143,7 +151,12 @@ class InMemoryJobStore:
     async def cancel_job(self, job_id: str) -> None:
         async with self.lock:
             self.canceled.add(job_id)
-            self.status[job_id] = {"status": "cancelled", "created_ts": time.time()}
+            now = time.time()
+            current = self.status.get(job_id, {})
+            if "created_ts" not in current:
+                current["created_ts"] = now
+            current.update({"status": "cancelled", "cancelled_ts": now})
+            self.status[job_id] = current
             waiter = self.result_waiters.pop(job_id, None)
             if waiter and not waiter.done():
                 waiter.set_result(
@@ -151,6 +164,27 @@ class InMemoryJobStore:
                         "status": "cancelled",
                         "request_id": job_id,
                         "error": "Request cancelled",
+                    }
+                )
+            self.results.pop(job_id, None)
+
+    async def timeout_job(self, job_id: str) -> None:
+        """Mark a job as timed out and prevent it from being processed."""
+        async with self.lock:
+            self.canceled.add(job_id)
+            now = time.time()
+            current = self.status.get(job_id, {})
+            if "created_ts" not in current:
+                current["created_ts"] = now
+            current.update({"status": "timeout", "timeout_ts": now})
+            self.status[job_id] = current
+            waiter = self.result_waiters.pop(job_id, None)
+            if waiter and not waiter.done():
+                waiter.set_result(
+                    {
+                        "status": "timeout",
+                        "request_id": job_id,
+                        "error": "Request timed out",
                     }
                 )
             self.results.pop(job_id, None)

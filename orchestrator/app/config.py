@@ -16,6 +16,15 @@ class Settings(BaseSettings):
     enable_request_logs: bool = False
     metrics_interval_seconds: int = 5
     job_timeout_seconds: int = 3600
+    # WebSocket/backpressure limits (defense-in-depth)
+    # - max_ws_message_bytes: reject overly large WS frames early (before JSON parse)
+    # - ws_incoming_queue_maxsize: bound per-connection buffering between receiver/main loop
+    # - max_pending_jobs_per_connection: cap in-flight jobs per WS connection
+    # - max_queue_depth: cap global queued jobs (not counting active workers)
+    max_ws_message_bytes: int = 20_000_000
+    ws_incoming_queue_maxsize: int = 256
+    max_pending_jobs_per_connection: int = 64
+    max_queue_depth: int = 5000
     openapi_version: str = "3.1.1"
     log_level: str = "INFO"
     structural_log_id: Optional[str] = None

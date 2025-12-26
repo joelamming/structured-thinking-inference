@@ -101,6 +101,28 @@ async def create_http_client() -> httpx.AsyncClient:
     )
 
 
+def ws_error_payload(
+    error: str,
+    *,
+    request_id: Optional[str] = None,
+    error_code: str = "error",
+    retry_after_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "status": "error",
+        "request_id": request_id,
+        "error": error,
+        "error_code": error_code,
+    }
+    if retry_after_seconds is not None:
+        payload["retry_after_seconds"] = retry_after_seconds
+    return payload
+
+
+def ws_timeout_payload(request_id: str) -> Dict[str, Any]:
+    return {"status": "timeout", "request_id": request_id, "error": "Request timed out"}
+
+
 async def worker_loop():
     assert job_store and http_client
     completions_url = settings.llm_server_url
@@ -110,7 +132,7 @@ async def worker_loop():
             job_tuple = await job_store.get_next_job(timeout_seconds=1)
             if not job_tuple:
                 continue
-            job_id, request_payload, client_request_id = job_tuple
+            job_id, job_type, request_payload, client_request_id = job_tuple
             # Skip if canceled before processing
             status_record = await job_store.get_status(job_id)
             if status_record and status_record.get("status") == "cancelled":
@@ -119,29 +141,14 @@ async def worker_loop():
             active_incremented = True
             await job_store.update_status(job_id, "running", started_ts=time.time())
 
-            # Determine job type by checking payload structure
-            # OCR requests have 'messages' with image_url content types
-            # Chat requests have 'messages' with simpler structure and 'thinking_effort'
-            is_ocr_job = False
-            if "thinking_effort" not in request_payload:
-                # Likely an OCR job - validate with OCRRequest model
-                try:
-                    ocr_request = OCRRequest.model_validate(request_payload)
-                    is_ocr_job = True
-                except Exception:
-                    # Fall back to ChatRequest
-                    pass
-
-            if is_ocr_job:
-                # Process as OCR request
+            if job_type == "ocr":
                 ocr_request = OCRRequest.model_validate(request_payload)
                 result_payload = await process_ocr_request(
                     ocr_request,
                     job_id=job_id,
                     client_request_id=client_request_id,
                 )
-            else:
-                # Process as Chat request (existing logic)
+            elif job_type == "chat":
                 chat_request = ChatRequest.model_validate(request_payload)
                 result_payload = await process_chat_request(
                     chat_request,
@@ -149,6 +156,8 @@ async def worker_loop():
                     client_request_id=client_request_id,
                     completions_url=completions_url,
                 )
+            else:
+                raise ValueError(f"Unknown job_type '{job_type}'")
 
             await job_store.update_status(job_id, "completed", finished_ts=time.time())
             await job_store.publish_result(
@@ -160,7 +169,7 @@ async def worker_loop():
                     "request_id": job_id,
                     "client_request_id": client_request_id,
                     "status": "completed",
-                    "job_type": "ocr" if is_ocr_job else "chat",
+                    "job_type": job_type,
                     "response_metadata": result_payload.get("usage"),
                     "timestamp": time.time(),
                 }
@@ -178,6 +187,7 @@ async def worker_loop():
                         "request_id": job_id,
                         "status": "error",
                         "error": str(exc),
+                        "job_type": locals().get("job_type", "unknown"),
                         "timestamp": time.time(),
                     }
                 )
@@ -672,7 +682,10 @@ async def websocket_completions(websocket: WebSocket):
 
     # Shared state for concurrent tasks
     pending_jobs: dict[str, float] = {}  # job_id -> deadline timestamp
-    incoming_requests: asyncio.Queue[dict] = asyncio.Queue()
+    incoming_requests: asyncio.Queue[dict] = asyncio.Queue(
+        maxsize=settings.ws_incoming_queue_maxsize
+    )
+    client_request_ids: dict[str, str] = {}  # client_request_id -> job_id
     connection_alive = True
     last_client_activity = time.time()
     shutdown_event = asyncio.Event()
@@ -697,8 +710,32 @@ async def websocket_completions(websocket: WebSocket):
                         timeout=1.0,  # Short timeout to check shutdown_event
                     )
                     last_client_activity = time.time()
+                    message_size = len(message.encode("utf-8"))
+                    if message_size > settings.max_ws_message_bytes:
+                        logger.warning(
+                            "WebSocket message too large (%d bytes > %d bytes)",
+                            message_size,
+                            settings.max_ws_message_bytes,
+                        )
+                        try:
+                            await websocket.send_json(
+                                ws_error_payload(
+                                    "Message too large",
+                                    error_code="message_too_large",
+                                )
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await websocket.close(code=status.WS_1009_MESSAGE_TOO_BIG)
+                        except Exception:
+                            pass
+                        connection_alive = False
+                        break
                     try:
                         payload = json.loads(message)
+                        if not isinstance(payload, dict):
+                            raise ValueError("Payload must be a JSON object")
                         msg_type = payload.get("type")
 
                         if msg_type == "pong":
@@ -706,19 +743,61 @@ async def websocket_completions(websocket: WebSocket):
                             continue
                         elif msg_type == "cancel":
                             # Client wants to cancel a job
-                            cancel_job_id = payload.get("request_id")
-                            if cancel_job_id and cancel_job_id in pending_jobs:
-                                await job_store.cancel_job(cancel_job_id)
-                                pending_jobs.pop(cancel_job_id, None)
+                            cancel_request_id = payload.get("request_id")
+                            cancel_client_request_id = payload.get("client_request_id")
+                            resolved_job_id: Optional[str] = None
+                            for candidate in (
+                                cancel_request_id,
+                                cancel_client_request_id,
+                            ):
+                                if not candidate:
+                                    continue
+                                if candidate in pending_jobs:
+                                    resolved_job_id = candidate
+                                    break
+                                if candidate in client_request_ids:
+                                    resolved_job_id = client_request_ids.get(candidate)
+                                    break
+                            if resolved_job_id:
+                                await job_store.cancel_job(resolved_job_id)
+                                pending_jobs.pop(resolved_job_id, None)
+                                for k, v in list(client_request_ids.items()):
+                                    if v == resolved_job_id:
+                                        client_request_ids.pop(k, None)
                             continue
                         else:
                             # Assume it's a completion request
-                            await incoming_requests.put(payload)
+                            try:
+                                incoming_requests.put_nowait(payload)
+                            except asyncio.QueueFull:
+                                try:
+                                    await websocket.send_json(
+                                        ws_error_payload(
+                                            "Too many pending requests",
+                                            error_code="backpressure",
+                                            retry_after_seconds=1,
+                                        )
+                                    )
+                                except Exception:
+                                    pass
                     except json.JSONDecodeError as exc:
                         logger.warning("Invalid JSON from client: %s", exc)
                         try:
                             await websocket.send_json(
-                                {"type": "error", "error": f"Invalid JSON: {exc}"}
+                                ws_error_payload(
+                                    f"Invalid JSON: {exc}", error_code="invalid_json"
+                                )
+                            )
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        logger.warning("Invalid message from client: %s", exc)
+                        try:
+                            await websocket.send_json(
+                                ws_error_payload(
+                                    f"Invalid message: {exc}",
+                                    error_code="invalid_message",
+                                )
                             )
                         except Exception:
                             pass
@@ -786,18 +865,48 @@ async def websocket_completions(websocket: WebSocket):
 
     try:
         while connection_alive:
-            # Process incoming requests (non-blocking check)
-            try:
-                payload = incoming_requests.get_nowait()
+            # Process incoming requests (drain queue with backpressure checks)
+            drained = 0
+            while drained < 50:
                 try:
+                    payload = incoming_requests.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                drained += 1
+                try:
+                    if len(pending_jobs) >= settings.max_pending_jobs_per_connection:
+                        await websocket.send_json(
+                            ws_error_payload(
+                                "Too many in-flight requests for this connection",
+                                error_code="too_many_requests",
+                                retry_after_seconds=1,
+                            )
+                        )
+                        continue
+
+                    counters = await job_store.get_counters()
+                    if counters["queue_depth"] >= settings.max_queue_depth:
+                        await websocket.send_json(
+                            ws_error_payload(
+                                "Server overloaded (queue full)",
+                                error_code="server_overloaded",
+                                retry_after_seconds=1,
+                            )
+                        )
+                        continue
+
                     ws_request = CompletionWebSocketRequest.model_validate(payload)
-                    job_id = await job_store.enqueue_job(
-                        ws_request.request.model_dump(),
-                        ws_request.client_request_id,
-                    )
                     timeout_seconds = int(
                         ws_request.timeout_seconds or settings.job_timeout_seconds
                     )
+                    job_id = await job_store.enqueue_job(
+                        "chat",
+                        ws_request.request.model_dump(),
+                        ws_request.client_request_id,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    if ws_request.client_request_id:
+                        client_request_ids[ws_request.client_request_id] = job_id
                     pending_jobs[job_id] = time.time() + timeout_seconds
                     # Start a waiter task for this job
                     active_waiters[job_id] = asyncio.create_task(
@@ -807,12 +916,13 @@ async def websocket_completions(websocket: WebSocket):
                     logger.warning("Invalid request payload: %s", exc)
                     try:
                         await websocket.send_json(
-                            {"type": "error", "error": f"Invalid payload: {exc}"}
+                            ws_error_payload(
+                                f"Invalid payload: {exc}",
+                                error_code="invalid_payload",
+                            )
                         )
                     except Exception:
                         pass
-            except asyncio.QueueEmpty:
-                pass
 
             # Check for completed job waiters
             completed_waiters = [
@@ -821,20 +931,17 @@ async def websocket_completions(websocket: WebSocket):
             for job_id in completed_waiters:
                 task = active_waiters.pop(job_id)
                 pending_jobs.pop(job_id, None)
+                for k, v in list(client_request_ids.items()):
+                    if v == job_id:
+                        client_request_ids.pop(k, None)
                 try:
                     result = task.result()
                     if result is not None:
                         await websocket.send_json(result)
                     else:
                         # Timed out
-                        await job_store.cancel_job(job_id)
-                        await websocket.send_json(
-                            {
-                                "type": "timeout",
-                                "request_id": job_id,
-                                "error": "Request timed out",
-                            }
-                        )
+                        await job_store.timeout_job(job_id)
+                        await websocket.send_json(ws_timeout_payload(job_id))
                 except asyncio.CancelledError:
                     await job_store.cancel_job(job_id)
                 except Exception as exc:
@@ -850,15 +957,12 @@ async def websocket_completions(websocket: WebSocket):
                 if job_id in active_waiters:
                     active_waiters[job_id].cancel()
                     active_waiters.pop(job_id, None)
-                await job_store.cancel_job(job_id)
+                for k, v in list(client_request_ids.items()):
+                    if v == job_id:
+                        client_request_ids.pop(k, None)
+                await job_store.timeout_job(job_id)
                 try:
-                    await websocket.send_json(
-                        {
-                            "type": "timeout",
-                            "request_id": job_id,
-                            "error": "Request timed out",
-                        }
-                    )
+                    await websocket.send_json(ws_timeout_payload(job_id))
                 except Exception:
                     pass
 
@@ -918,7 +1022,10 @@ async def websocket_ocr(websocket: WebSocket):
 
     # Shared state for concurrent tasks
     pending_jobs: dict[str, float] = {}  # job_id -> deadline timestamp
-    incoming_requests: asyncio.Queue[dict] = asyncio.Queue()
+    incoming_requests: asyncio.Queue[dict] = asyncio.Queue(
+        maxsize=settings.ws_incoming_queue_maxsize
+    )
+    client_request_ids: dict[str, str] = {}  # client_request_id -> job_id
     connection_alive = True
     last_client_activity = time.time()
     shutdown_event = asyncio.Event()
@@ -941,8 +1048,32 @@ async def websocket_ocr(websocket: WebSocket):
                         timeout=1.0,  # Short timeout to check shutdown_event
                     )
                     last_client_activity = time.time()
+                    message_size = len(message.encode("utf-8"))
+                    if message_size > settings.max_ws_message_bytes:
+                        logger.warning(
+                            "WebSocket message too large (%d bytes > %d bytes)",
+                            message_size,
+                            settings.max_ws_message_bytes,
+                        )
+                        try:
+                            await websocket.send_json(
+                                ws_error_payload(
+                                    "Message too large",
+                                    error_code="message_too_large",
+                                )
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await websocket.close(code=status.WS_1009_MESSAGE_TOO_BIG)
+                        except Exception:
+                            pass
+                        connection_alive = False
+                        break
                     try:
                         payload = json.loads(message)
+                        if not isinstance(payload, dict):
+                            raise ValueError("Payload must be a JSON object")
                         msg_type = payload.get("type")
 
                         if msg_type == "pong":
@@ -950,19 +1081,61 @@ async def websocket_ocr(websocket: WebSocket):
                             continue
                         elif msg_type == "cancel":
                             # Client wants to cancel a job
-                            cancel_job_id = payload.get("request_id")
-                            if cancel_job_id and cancel_job_id in pending_jobs:
-                                await job_store.cancel_job(cancel_job_id)
-                                pending_jobs.pop(cancel_job_id, None)
+                            cancel_request_id = payload.get("request_id")
+                            cancel_client_request_id = payload.get("client_request_id")
+                            resolved_job_id: Optional[str] = None
+                            for candidate in (
+                                cancel_request_id,
+                                cancel_client_request_id,
+                            ):
+                                if not candidate:
+                                    continue
+                                if candidate in pending_jobs:
+                                    resolved_job_id = candidate
+                                    break
+                                if candidate in client_request_ids:
+                                    resolved_job_id = client_request_ids.get(candidate)
+                                    break
+                            if resolved_job_id:
+                                await job_store.cancel_job(resolved_job_id)
+                                pending_jobs.pop(resolved_job_id, None)
+                                for k, v in list(client_request_ids.items()):
+                                    if v == resolved_job_id:
+                                        client_request_ids.pop(k, None)
                             continue
                         else:
                             # Assume it's an OCR request
-                            await incoming_requests.put(payload)
+                            try:
+                                incoming_requests.put_nowait(payload)
+                            except asyncio.QueueFull:
+                                try:
+                                    await websocket.send_json(
+                                        ws_error_payload(
+                                            "Too many pending requests",
+                                            error_code="backpressure",
+                                            retry_after_seconds=1,
+                                        )
+                                    )
+                                except Exception:
+                                    pass
                     except json.JSONDecodeError as exc:
                         logger.warning("Invalid JSON from client: %s", exc)
                         try:
                             await websocket.send_json(
-                                {"type": "error", "error": f"Invalid JSON: {exc}"}
+                                ws_error_payload(
+                                    f"Invalid JSON: {exc}", error_code="invalid_json"
+                                )
+                            )
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        logger.warning("Invalid message from client: %s", exc)
+                        try:
+                            await websocket.send_json(
+                                ws_error_payload(
+                                    f"Invalid message: {exc}",
+                                    error_code="invalid_message",
+                                )
                             )
                         except Exception:
                             pass
@@ -1030,18 +1203,48 @@ async def websocket_ocr(websocket: WebSocket):
 
     try:
         while connection_alive:
-            # Process incoming requests (non-blocking check)
-            try:
-                payload = incoming_requests.get_nowait()
+            # Process incoming requests (drain queue with backpressure checks)
+            drained = 0
+            while drained < 50:
                 try:
+                    payload = incoming_requests.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                drained += 1
+                try:
+                    if len(pending_jobs) >= settings.max_pending_jobs_per_connection:
+                        await websocket.send_json(
+                            ws_error_payload(
+                                "Too many in-flight requests for this connection",
+                                error_code="too_many_requests",
+                                retry_after_seconds=1,
+                            )
+                        )
+                        continue
+
+                    counters = await job_store.get_counters()
+                    if counters["queue_depth"] >= settings.max_queue_depth:
+                        await websocket.send_json(
+                            ws_error_payload(
+                                "Server overloaded (queue full)",
+                                error_code="server_overloaded",
+                                retry_after_seconds=1,
+                            )
+                        )
+                        continue
+
                     ws_request = OCRWebSocketRequest.model_validate(payload)
-                    job_id = await job_store.enqueue_job(
-                        ws_request.request.model_dump(),
-                        ws_request.client_request_id,
-                    )
                     timeout_seconds = int(
                         ws_request.timeout_seconds or settings.job_timeout_seconds
                     )
+                    job_id = await job_store.enqueue_job(
+                        "ocr",
+                        ws_request.request.model_dump(),
+                        ws_request.client_request_id,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    if ws_request.client_request_id:
+                        client_request_ids[ws_request.client_request_id] = job_id
                     pending_jobs[job_id] = time.time() + timeout_seconds
                     # Start a waiter task for this job
                     active_waiters[job_id] = asyncio.create_task(
@@ -1051,12 +1254,13 @@ async def websocket_ocr(websocket: WebSocket):
                     logger.warning("Invalid OCR request payload: %s", exc)
                     try:
                         await websocket.send_json(
-                            {"type": "error", "error": f"Invalid payload: {exc}"}
+                            ws_error_payload(
+                                f"Invalid payload: {exc}",
+                                error_code="invalid_payload",
+                            )
                         )
                     except Exception:
                         pass
-            except asyncio.QueueEmpty:
-                pass
 
             # Check for completed job waiters
             completed_waiters = [
@@ -1065,20 +1269,17 @@ async def websocket_ocr(websocket: WebSocket):
             for job_id in completed_waiters:
                 task = active_waiters.pop(job_id)
                 pending_jobs.pop(job_id, None)
+                for k, v in list(client_request_ids.items()):
+                    if v == job_id:
+                        client_request_ids.pop(k, None)
                 try:
                     result = task.result()
                     if result is not None:
                         await websocket.send_json(result)
                     else:
                         # Timed out
-                        await job_store.cancel_job(job_id)
-                        await websocket.send_json(
-                            {
-                                "type": "timeout",
-                                "request_id": job_id,
-                                "error": "Request timed out",
-                            }
-                        )
+                        await job_store.timeout_job(job_id)
+                        await websocket.send_json(ws_timeout_payload(job_id))
                 except asyncio.CancelledError:
                     await job_store.cancel_job(job_id)
                 except Exception as exc:
@@ -1094,15 +1295,12 @@ async def websocket_ocr(websocket: WebSocket):
                 if job_id in active_waiters:
                     active_waiters[job_id].cancel()
                     active_waiters.pop(job_id, None)
-                await job_store.cancel_job(job_id)
+                for k, v in list(client_request_ids.items()):
+                    if v == job_id:
+                        client_request_ids.pop(k, None)
+                await job_store.timeout_job(job_id)
                 try:
-                    await websocket.send_json(
-                        {
-                            "type": "timeout",
-                            "request_id": job_id,
-                            "error": "Request timed out",
-                        }
-                    )
+                    await websocket.send_json(ws_timeout_payload(job_id))
                 except Exception:
                     pass
 
