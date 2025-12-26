@@ -10,17 +10,48 @@ This script validates that the OCR endpoint is working correctly with:
 5. Keepalive handling
 
 Usage:
-    python test_ocr_endpoint.py --url wss://your-instance/ws/ocr --api-key YOUR_KEY --encryption-key YOUR_FERNET_KEY --image path/to/image.png
+    python test_ocr_endpoint.py --image path/to/image.png
+
+Required env vars (loaded from ./.env via python-dotenv):
+    ORCH_URL              e.g. https://orchestrator-host (or http://...)
+    ORCH_API_KEY
+    ORCH_ENCRYPTION_KEY   Fernet key
 """
 
 import asyncio
 import argparse
 import base64
 import json
+import os
 import sys
 from pathlib import Path
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet  # type: ignore[import-not-found]
 import websockets  # type: ignore[import-untyped]
+
+def _strip_quotes(v: str) -> str:
+    return v.strip().strip("'").strip('"').strip()
+
+
+def _to_ws_base_url(orch_url: str) -> str:
+    """
+    Convert a base orchestrator URL to a websocket base URL.
+
+    Examples:
+      https://host -> wss://host
+      http://host  -> ws://host
+      wss://host   -> wss://host
+      ws://host    -> ws://host
+    """
+    u = _strip_quotes(orch_url).rstrip("/")
+    if u.startswith("https://"):
+        return "wss://" + u[len("https://") :]
+    if u.startswith("http://"):
+        return "ws://" + u[len("http://") :]
+    if u.startswith("wss://") or u.startswith("ws://"):
+        return u
+    raise SystemExit(
+        f"Invalid ORCH_URL scheme: {orch_url!r}. Expected http(s):// or ws(s)://"
+    )
 
 
 class OCREndpointTester:
@@ -80,7 +111,7 @@ class OCREndpointTester:
                     }
                 ],
                 "max_tokens": 8000,
-                "temperature": 0.6,
+                "temperature": 0.0,
             },
             "client_request_id": f"test-{image_path.stem}",
             "timeout_seconds": 300,
@@ -92,13 +123,14 @@ class OCREndpointTester:
         try:
             headers = {"X-API-Key": self.api_key}
             async with websockets.connect(  # type: ignore[attr-defined]
-                self.ws_url, extra_headers=headers, open_timeout=10
+                self.ws_url, additional_headers=headers, open_timeout=10
             ):
                 print("  ✓ Connection established")
                 print("  ✓ Authentication successful")
                 return True
-        except websockets.exceptions.InvalidStatusCode as e:
-            if e.status_code == 403:
+        except (websockets.exceptions.InvalidStatus, websockets.exceptions.InvalidStatusCode) as e:
+            status_code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 403:
                 print("  ✗ Authentication failed (403)")
             else:
                 print(f"  ✗ Connection failed: {e}")
@@ -112,7 +144,7 @@ class OCREndpointTester:
         print("\nTest 2: Keepalive Ping/Pong")
         try:
             headers = {"X-API-Key": self.api_key}
-            async with websockets.connect(self.ws_url, extra_headers=headers) as ws:
+            async with websockets.connect(self.ws_url, additional_headers=headers) as ws:
                 # Wait for ping
                 print("  Waiting for ping (up to 20 seconds)...")
                 msg = await asyncio.wait_for(ws.recv(), timeout=20)
@@ -140,7 +172,7 @@ class OCREndpointTester:
         print("\nTest 3: OCR Request/Response")
         try:
             headers = {"X-API-Key": self.api_key}
-            async with websockets.connect(self.ws_url, extra_headers=headers) as ws:  # type: ignore[attr-defined]
+            async with websockets.connect(self.ws_url, additional_headers=headers) as ws:  # type: ignore[attr-defined]
                 # Build and send request
                 request = self.build_request(image_path)
                 print(f"  Sending OCR request for: {image_path.name}")
@@ -168,8 +200,8 @@ class OCREndpointTester:
                         decrypted = self.decrypt(encrypted_content)
 
                         print("  ✓ Successfully decrypted response")
-                        print("\n  Markdown Output (first 200 chars):")
-                        print(f"  {decrypted[:200]}...")
+                        print("\n  Markdown Output:")
+                        print(f"  {decrypted}")
 
                         # Check usage stats
                         usage = data["result"].get("usage", {})
@@ -260,13 +292,35 @@ class OCREndpointTester:
 async def main():
     parser = argparse.ArgumentParser(description="Test /ws/ocr endpoint")
     parser.add_argument(
-        "--url", required=True, help="WebSocket URL (e.g., wss://host/ws/ocr)"
+        "--image",
+        type=Path,
+        required=True,
+        help="Path to test image",
     )
-    parser.add_argument("--api-key", required=True, help="API key (ORCH_API_KEY)")
-    parser.add_argument("--encryption-key", required=True, help="Fernet encryption key")
-    parser.add_argument("--image", type=Path, help="Path to test image (optional)")
 
     args = parser.parse_args()
+
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "python-dotenv is required to load .env for this test script.\n"
+        ) from exc
+
+    load_dotenv(dotenv_path=Path(".env"), override=False)
+
+    orch_url = _strip_quotes(os.environ.get("ORCH_URL", ""))
+    api_key = _strip_quotes(os.environ.get("ORCH_API_KEY", ""))
+    encryption_key = _strip_quotes(os.environ.get("ORCH_ENCRYPTION_KEY", ""))
+
+    if not orch_url:
+        raise SystemExit("Missing required env var: ORCH_URL")
+    if not api_key:
+        raise SystemExit("Missing required env var: ORCH_API_KEY")
+    if not encryption_key:
+        raise SystemExit("Missing required env var: ORCH_ENCRYPTION_KEY")
+
+    ws_url = _to_ws_base_url(orch_url) + "/ws/ocr"
 
     # Validate image if provided
     if args.image and not args.image.exists():
@@ -274,7 +328,7 @@ async def main():
         return 1
 
     # Run tests
-    tester = OCREndpointTester(args.url, args.api_key, args.encryption_key)
+    tester = OCREndpointTester(ws_url, api_key, encryption_key)
     return await tester.run_all_tests(args.image)
 
 
