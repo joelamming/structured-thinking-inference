@@ -28,6 +28,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet  # type: ignore[import-not-found]
 import websockets  # type: ignore[import-untyped]
 
+
 def _strip_quotes(v: str) -> str:
     return v.strip().strip("'").strip('"').strip()
 
@@ -128,8 +129,13 @@ class OCREndpointTester:
                 print("  ✓ Connection established")
                 print("  ✓ Authentication successful")
                 return True
-        except (websockets.exceptions.InvalidStatus, websockets.exceptions.InvalidStatusCode) as e:
-            status_code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+        except (
+            websockets.exceptions.InvalidStatus,
+            websockets.exceptions.InvalidStatusCode,
+        ) as e:
+            status_code = getattr(e, "status_code", None) or getattr(
+                getattr(e, "response", None), "status_code", None
+            )
             if status_code == 403:
                 print("  ✗ Authentication failed (403)")
             else:
@@ -144,7 +150,9 @@ class OCREndpointTester:
         print("\nTest 2: Keepalive Ping/Pong")
         try:
             headers = {"X-API-Key": self.api_key}
-            async with websockets.connect(self.ws_url, additional_headers=headers) as ws:
+            async with websockets.connect(
+                self.ws_url, additional_headers=headers
+            ) as ws:
                 # Wait for ping
                 print("  Waiting for ping (up to 20 seconds)...")
                 msg = await asyncio.wait_for(ws.recv(), timeout=20)
@@ -172,7 +180,9 @@ class OCREndpointTester:
         print("\nTest 3: OCR Request/Response")
         try:
             headers = {"X-API-Key": self.api_key}
-            async with websockets.connect(self.ws_url, additional_headers=headers) as ws:  # type: ignore[attr-defined]
+            async with websockets.connect(  # type: ignore[attr-defined]
+                self.ws_url, additional_headers=headers
+            ) as ws:
                 # Build and send request
                 request = self.build_request(image_path)
                 print(f"  Sending OCR request for: {image_path.name}")

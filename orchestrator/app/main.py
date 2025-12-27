@@ -58,7 +58,7 @@ file_log_lock = asyncio.Lock()
 http_client: Optional[httpx.AsyncClient] = None
 job_store: Optional[InMemoryJobStore] = None
 metrics_sampler: Optional[MetricsSampler] = None
-worker_task: Optional[asyncio.Task] = None
+worker_tasks: List[asyncio.Task] = []
 metrics_task: Optional[asyncio.Task] = None
 cleanup_task: Optional[asyncio.Task] = None
 fernet = Fernet(
@@ -123,9 +123,14 @@ def ws_timeout_payload(request_id: str) -> Dict[str, Any]:
     return {"status": "timeout", "request_id": request_id, "error": "Request timed out"}
 
 
-async def worker_loop():
+async def worker_loop(worker_id: int):
+    """
+    Worker task that processes jobs from the queue.
+    Multiple workers can run concurrently to handle parallel requests.
+    """
     assert job_store and http_client
     completions_url = settings.llm_server_url
+    logger.debug(f"Worker {worker_id} started")
     while True:
         active_incremented = False
         try:
@@ -140,6 +145,10 @@ async def worker_loop():
             await job_store.increment_active()
             active_incremented = True
             await job_store.update_status(job_id, "running", started_ts=time.time())
+
+            logger.debug(
+                f"Worker {worker_id} processing job {job_id} (type: {job_type})"
+            )
 
             if job_type == "ocr":
                 ocr_request = OCRRequest.model_validate(request_payload)
@@ -175,7 +184,7 @@ async def worker_loop():
                 }
             )
         except Exception as exc:
-            logger.exception("Worker error")
+            logger.exception(f"Worker {worker_id} error")
             if "job_id" in locals():
                 await job_store.update_status(job_id, "error", error=str(exc))
                 await job_store.publish_result(
@@ -202,23 +211,51 @@ async def lifespan(app: FastAPI):
         http_client, \
         job_store, \
         metrics_sampler, \
-        worker_task, \
+        worker_tasks, \
         metrics_task, \
         cleanup_task
+
+    # Determine number of concurrent workers
+    # Default to 20 to handle typical concurrent load, configurable via env var
+    num_workers = int(os.getenv("NUM_WORKERS", "20"))
+    logger.info(f"Starting {num_workers} concurrent worker tasks")
+
     http_client = await create_http_client()
     job_store = InMemoryJobStore(settings)
     metrics_sampler = MetricsSampler(settings, job_store, http_client)
-    worker_task = asyncio.create_task(worker_loop())
+
+    # Spawn multiple concurrent workers
+    worker_tasks.clear()
+    for worker_id in range(num_workers):
+        task = asyncio.create_task(worker_loop(worker_id))
+        worker_tasks.append(task)
+
     metrics_task = asyncio.create_task(metrics_sampler.run())
     cleanup_task = asyncio.create_task(cleanup_loop())
+
     try:
         yield
     finally:
-        for task in (worker_task, metrics_task, cleanup_task):
+        # Cancel all worker tasks
+        for task in worker_tasks:
             if task:
                 task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
+        if metrics_task:
+            metrics_task.cancel()
+        if cleanup_task:
+            cleanup_task.cancel()
+
+        # Wait for cancellation to complete
+        for task in worker_tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        if metrics_task:
+            with suppress(asyncio.CancelledError):
+                await metrics_task
+        if cleanup_task:
+            with suppress(asyncio.CancelledError):
+                await cleanup_task
+
         if http_client:
             await http_client.aclose()
 
