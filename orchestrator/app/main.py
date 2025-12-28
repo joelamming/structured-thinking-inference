@@ -661,6 +661,12 @@ async def process_ocr_request(
     if request.extra_body:
         for key, value in request.extra_body.items():
             vllm_request[key] = value
+    
+    # Ensure vllm_xargs.ngram_size is set (required for NGramPerReqLogitsProcessor)
+    if "vllm_xargs" not in vllm_request:
+        vllm_request["vllm_xargs"] = {}
+    if "ngram_size" not in vllm_request["vllm_xargs"]:
+        vllm_request["vllm_xargs"]["ngram_size"] = 10
 
     logger.debug(f"{logger_prefix}Sending OCR request to {ocr_url}")
 
