@@ -662,11 +662,26 @@ async def process_ocr_request(
         for key, value in request.extra_body.items():
             vllm_request[key] = value
     
-    # Ensure vllm_xargs.ngram_size is set (required for NGramPerReqLogitsProcessor)
+    # Handle nested extra_body.vllm_xargs (OpenAI-style) by lifting to top-level
+    if "extra_body" in vllm_request and isinstance(vllm_request["extra_body"], dict):
+        nested_xargs = vllm_request["extra_body"].get("vllm_xargs")
+        if nested_xargs:
+            if "vllm_xargs" not in vllm_request:
+                vllm_request["vllm_xargs"] = {}
+            vllm_request["vllm_xargs"].update(nested_xargs)
+    
+    # Ensure vllm_xargs exists
     if "vllm_xargs" not in vllm_request:
         vllm_request["vllm_xargs"] = {}
-    if "ngram_size" not in vllm_request["vllm_xargs"]:
-        vllm_request["vllm_xargs"]["ngram_size"] = 10
+    
+    # Set defaults for NGramPerReqLogitsProcessor (required for OCR tables)
+    xargs = vllm_request["vllm_xargs"]
+    if "ngram_size" not in xargs:
+        xargs["ngram_size"] = 30  # Official docs default
+    if "window_size" not in xargs:
+        xargs["window_size"] = 1024  # For long tables
+    if "whitelist_token_ids" not in xargs:
+        xargs["whitelist_token_ids"] = [128821, 128822]  # <td>, </td> tokens
 
     logger.debug(f"{logger_prefix}Sending OCR request to {ocr_url}")
 
