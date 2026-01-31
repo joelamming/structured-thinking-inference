@@ -582,7 +582,7 @@ async def process_ocr_request(
     client_request_id: Optional[str],
 ) -> Dict[str, Any]:
     """
-    Process an OCR request by decrypting messages, calling vLLM DeepSeek-OCR,
+    Process an OCR request by decrypting messages, calling vLLM DeepSeek-OCR-2,
     and encrypting the response.
 
     Unlike process_chat_request, this is a simple pass-through:
@@ -677,9 +677,9 @@ async def process_ocr_request(
     # Set defaults for NGramPerReqLogitsProcessor (required for OCR tables)
     xargs = vllm_request["vllm_xargs"]
     if "ngram_size" not in xargs:
-        xargs["ngram_size"] = 30  # Official docs default
+        xargs["ngram_size"] = 20  # OCR2 reference default
     if "window_size" not in xargs:
-        xargs["window_size"] = 1024  # For long tables
+        xargs["window_size"] = 90  # OCR2 reference default
     if "whitelist_token_ids" not in xargs:
         xargs["whitelist_token_ids"] = [128821, 128822]  # <td>, </td> tokens
 
@@ -1060,7 +1060,7 @@ async def websocket_completions(websocket: WebSocket):
 @app.websocket("/ws/ocr")
 async def websocket_ocr(websocket: WebSocket):
     """
-    WebSocket endpoint for OCR requests using DeepSeek-OCR model.
+    WebSocket endpoint for OCR requests using DeepSeek-OCR-2 model.
 
     Handles image-to-markdown/HTML conversion requests with:
     - Symmetric encryption for image data and responses

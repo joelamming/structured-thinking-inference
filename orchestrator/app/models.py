@@ -61,13 +61,13 @@ class CompletionWebSocketRequest(BaseModel):
 
 class OCRRequest(BaseModel):
     """
-    OCR request for DeepSeek-OCR model.
+    OCR request for DeepSeek-OCR-2 model.
     Messages should follow OpenAI chat format with image_url content.
     """
 
     messages: List[Dict[str, Any]]
-    model: str = Field(default="deepseek-ai/DeepSeek-OCR", min_length=1)
-    max_tokens: int = 4000
+    model: str = Field(default="deepseek-ai/DeepSeek-OCR-2", min_length=1)
+    max_tokens: int = 8192
     temperature: float = 0.0
     extra_body: Optional[Dict[str, Any]] = None
 

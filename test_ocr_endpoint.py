@@ -91,14 +91,16 @@ class OCREndpointTester:
         return f"data:{mime_type};base64,{img_data}"
 
     def build_request(
-        self, image_path: Path, prompt: str = "Convert the document to markdown."
+        self,
+        image_path: Path,
+        prompt: str = "<image>\n<|grounding|>Convert the document to markdown.",
     ) -> dict:
         """Build an encrypted OCR request."""
         data_url = self.image_to_data_url(image_path)
 
         return {
             "request": {
-                "model": "deepseek-ai/DeepSeek-OCR",
+                "model": "deepseek-ai/DeepSeek-OCR-2",
                 "messages": [
                     {
                         "role": "user",
@@ -111,7 +113,7 @@ class OCREndpointTester:
                         ],
                     }
                 ],
-                "max_tokens": 8000,
+                "max_tokens": 8192,
                 "temperature": 0.0,
             },
             "client_request_id": f"test-{image_path.stem}",
